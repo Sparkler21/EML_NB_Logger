@@ -14,14 +14,16 @@
 
 // ---------- User config ----------
 #define DEVICE_ID   "DL-01"
-#define APN         "your.apn.here"      // e.g. "lpwa.vodafone.com" or as given by your provider
+#define APN         "your.apn.here"      // e.g. Vodafone LPWA APN, or what your SIM provider gives you
 #define APN_USER    ""
 #define APN_PASS    ""
-#define USE_NBIOT   false                // true to prefer NB-IoT; false for Cat-M1 (LTE-M)
+#define USE_NBIOT   false                // true = NB-IoT, false = LTE-M (if supported by your core)
 
 const char* MQTT_HOST = "broker.example.com";
-const int   MQTT_PORT = 1883;            // use 8883 if you add TLS later
+const int   MQTT_PORT = 1883;            // 8883 if you add TLS later
 const char* MQTT_TOPIC = "sensors/dl01";
+
+const char* PINNUMBER = "";              // SIM PIN if you have one; else ""
 
 // Cadence
 const uint32_t SAMPLE_INTERVAL_SEC  = 300;   // 5 min sample
@@ -39,12 +41,19 @@ RTCZero rtc;
 Adafruit_ADS1115 ads;
 
 NB nbAccess;
-GPRS gprs;                       // yes, still named GPRS in MKRNB for PDP context handling
+GPRS gprs;
 NBClient nbClient;
 MqttClient mqtt(nbClient);
 
-uint32_t bootEpoch = 0;          // optional: keep zero if you don't care about absolute epoch
-uint32_t lastPublishTs = 0;
+// --- ISRs (no ESP32 attributes on SAMD21) ---
+void rainISR() {
+  uint32_t t = micros();
+  if (t - lastPulseUs > 5000) { // ~5 ms debounce
+    rainCount++;
+    lastPulseUs = t;
+  }
+}
+void wakeupISR() { /* empty, just to satisfy attachInterruptWakeup */ }
 
 // Simple ring buffer for samples between publishes
 struct Sample { uint32_t ts; int16_t analog; uint16_t tips; };
@@ -52,22 +61,20 @@ const size_t BUF_MAX = 300;
 Sample buf[BUF_MAX];
 size_t headIdx = 0, tailIdx = 0;
 
-void IRAM_ATTR rainISR() {
-  uint32_t t = micros();
-  if (t - lastPulseUs > 5000) { // ~5 ms debounce
-    rainCount++;
-    lastPulseUs = t;
-  }
-}
+// Fwds
+void takeSample();
+bool connectNetwork();
+bool connectMQTT();
+void publishBuffer();
+void sleepFor(uint32_t seconds);
 
 void setup() {
-  // Serial for debugging
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}
 
   // I2C + ADC
   Wire.begin();
-  ads.setGain(GAIN_ONE); // ±4.096V; pick a better gain for your sensor range
+  ads.setGain(GAIN_ONE); // ±4.096V; tune to your sensor range
   if (!ads.begin()) {
     Serial.println("ADS1115 not found!");
   }
@@ -76,56 +83,63 @@ void setup() {
   pinMode(PIN_RAIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_RAIN), rainISR, FALLING);
 
-  // RTC for timed wake
+  // RTC + low power
   rtc.begin();
   rtc.setEpoch(0);
+  LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), wakeupISR, FALLING);
 
-  // Low power: allow wake on RTC alarm and external interrupt
-  LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), []{}, FALLING);
-
-  // Optional: set radio access technology
-  // MKRNB exposes: nbAccess.setRadioAccessTechnology(RADIO_ACCESS_TECHNOLOGY_EUTRAN) for LTE-M,
-  // and RADIO_ACCESS_TECHNOLOGY_NBIOT for NB-IoT on some versions.
-  // Not all core versions have this call; if unavailable, skip and let network decide.
+  // Optional RAT select (only if your MKRNB version exposes it)
   #ifdef RADIO_ACCESS_TECHNOLOGY_NBIOT
-  nbAccess.setRadioAccessTechnology(USE_NBIOT ? RADIO_ACCESS_TECHNOLOGY_NBIOT
-                                              : RADIO_ACCESS_TECHNOLOGY_EUTRAN);
+    nbAccess.setRadioAccessTechnology(
+      USE_NBIOT ? RADIO_ACCESS_TECHNOLOGY_NBIOT
+                : RADIO_ACCESS_TECHNOLOGY_EUTRAN
+    );
   #endif
 
-  // First sample immediately so we have data on first publish
+  // First sample immediately so first publish has data
   takeSample();
 }
 
 void loop() {
-  // Sample on cadence
   static uint32_t lastSample = 0;
   uint32_t now = rtc.getEpoch();
+
   if ((now - lastSample) >= SAMPLE_INTERVAL_SEC || lastSample == 0) {
     takeSample();
     lastSample = now;
   }
 
-  bool timeToPublish = (lastPublishTs == 0) || ((now - lastPublishTs) >= PUBLISH_INTERVAL_SEC);
+  bool timeToPublish = (lastSample != 0) &&
+                       ((now - lastSample) < 2) &&     // just after sampling
+                       ((now == 0) || ((now - (uint32_t)0) % PUBLISH_INTERVAL_SEC == 0)); // simple cadence gate
+
+  // More robust: track lastPublishTs; here we just do hourly after boot.
+  static uint32_t lastPublishTs = 0;
+  if (lastPublishTs == 0 || (now - lastPublishTs) >= PUBLISH_INTERVAL_SEC) {
+    timeToPublish = true;
+  }
+
   if (timeToPublish) {
     if (connectNetwork()) {
       if (connectMQTT()) {
         publishBuffer();
         mqtt.stop();
       }
-      // Power down modem cleanly to save energy
-      nbAccess.shutdown();  // if your core lacks shutdown(), use nbAccess.end()
+      // Cleanly detach and end to save power
+      gprs.detachGPRS();
+      nbAccess.shutdown();
     }
     lastPublishTs = rtc.getEpoch();
   }
 
-  // Sleep until the next interesting thing (next 1-second tick); RTC alarm handles longer waits.
+  // Sleep; RTC alarm or rain interrupt will wake us
   sleepFor(1);
 }
 
 // ---- Helpers ----
 void takeSample() {
   int16_t adc = ads.readADC_SingleEnded(0);
-  uint16_t tips = rainCount;  // snapshot
+  uint16_t tips = rainCount;  // snapshot since last sample
   rainCount = 0;
 
   uint32_t ts = rtc.getEpoch();
@@ -143,12 +157,10 @@ void takeSample() {
 
 bool connectNetwork() {
   Serial.println("Attaching cellular...");
-
-  // NB-IoT/LTE-M attach; the MKRNB library uses SIM PIN if needed.
-  // Try a few times; rural sites can take longer.
+  // Pass APN credentials here (correct for MKRNB)
   for (int i = 0; i < 3; i++) {
-    if (nbAccess.begin() == NB_READY) {
-      if (gprs.attachGPRS(APN, APN_USER, APN_PASS)) {
+    if (nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS) == NB_READY) {
+      if (gprs.attachGPRS() == GPRS_READY) {
         Serial.println("Cellular attached.");
         return true;
       }
@@ -162,9 +174,6 @@ bool connectNetwork() {
 bool connectMQTT() {
   Serial.println("Connecting MQTT...");
   mqtt.setId(DEVICE_ID);
-  // Optional: set username/password
-  // mqtt.setUsernamePassword("user", "pass");
-
   if (!mqtt.connect(MQTT_HOST, MQTT_PORT)) {
     Serial.print("MQTT connect failed, code=");
     Serial.println(mqtt.connectError());
@@ -180,7 +189,7 @@ void publishBuffer() {
     return;
   }
 
-  // Build a compact JSON batch: {"dev":"DL-01","int":300,"n":K,"t0":ts0,"a":[...],"c":[...]}
+  // Compact JSON batch
   String payload;
   payload.reserve(512);
   size_t from = tailIdx, to = headIdx;
@@ -200,13 +209,12 @@ void publishBuffer() {
   while (i != to) { if (!first) payload += ','; payload += buf[i].tips;   first = false; i = (i + 1) % BUF_MAX; }
   payload += "]}";
 
-  Serial.print("Publishing "); Serial.print(payload.length()); Serial.println(" bytes");
+  Serial.print("Publishing "); Serial.print(payload.length()); Serial.println(" bytes");  
 
   if (mqtt.beginMessage(MQTT_TOPIC, false, 1)) { // retained=false, QoS 1
     mqtt.print(payload);
     mqtt.endMessage();
-    // On success, advance tail
-    tailIdx = to;
+    tailIdx = to; // advance if OK
     Serial.println("Publish OK");
   } else {
     Serial.println("Publish beginMessage() failed");
@@ -215,11 +223,9 @@ void publishBuffer() {
 
 void sleepFor(uint32_t seconds) {
   if (seconds == 0) return;
-  // Program RTC alarm for seconds from now and deep sleep
+
   uint32_t now = rtc.getEpoch();
   uint32_t target = now + seconds;
-
-  // Convert to h:m:s for RTCZero alarm
   uint8_t h = (target / 3600) % 24;
   uint8_t m = (target / 60) % 60;
   uint8_t s = target % 60;

@@ -2,7 +2,7 @@
   MKR NB 1500 dual-mode (Cat-M1/NB-IoT) data logger
   - 1 analog (via ADS1115)
   - 1 contact-closure (rain gauge) on D7 (interrupt)
-  - Hourly MQTT publish, then deep sleep
+  - 10 minute MQTT publish, then deep sleep
 */
 
 #include <MKRNB.h>
@@ -13,21 +13,22 @@
 #include <Adafruit_ADS1X15.h>
 
 // ---------- User config ----------
-#define DEVICE_ID   "DL-01"
+#define DEVICE_ID   "EML_HPT_001"
 #define APN         "your.apn.here"      // e.g. Vodafone LPWA APN, or what your SIM provider gives you
 #define APN_USER    ""
 #define APN_PASS    ""
 #define USE_NBIOT   false                // true = NB-IoT, false = LTE-M (if supported by your core)
 
-const char* MQTT_HOST = "broker.example.com";
-const int   MQTT_PORT = 1883;            // 8883 if you add TLS later
-const char* MQTT_TOPIC = "sensors/dl01";
+const char* MQTT_HOST  = "mqtt.eu.thingsboard.cloud";
+const int   MQTT_PORT  = 1883;                    // 8883 if you later use TLS
+const char* MQTT_TOPIC = "v1/devices/me/telemetry";
+const char* TB_TOKEN = "lxQiBuxXNwTQttZ8Aody";    // <- your TB device token
 
 const char* PINNUMBER = "";              // SIM PIN if you have one; else ""
 
 // Cadence
-const uint32_t SAMPLE_INTERVAL_SEC  = 300;   // 5 min sample
-const uint32_t PUBLISH_INTERVAL_SEC = 3600;  // 1 hour publish
+const uint32_t SAMPLE_INTERVAL_SEC  = 60;   // 1 min sample
+const uint32_t PUBLISH_INTERVAL_SEC = 600;  // 10 minute publish
 // ---------------------------------
 
 // Pins
@@ -42,6 +43,7 @@ Adafruit_ADS1115 ads;
 
 NB nbAccess;
 GPRS gprs;
+NBUDP udp;
 NBClient nbClient;
 MqttClient mqtt(nbClient);
 
@@ -155,6 +157,37 @@ void takeSample() {
   Serial.print(" tips="); Serial.println(tips);
 }
 
+unsigned long ntpUnix() {
+  const char* host = "pool.ntp.org";
+  const int NTP_PORT = 123;
+  byte pkt[48] = {0};
+  pkt[0] = 0b11100011; // LI, Version, Mode
+  if (udp.begin(2390) != 1) return 0;
+  if (!udp.beginPacket(host, NTP_PORT)) return 0;
+  udp.write(pkt, 48);
+  udp.endPacket();
+
+  uint32_t t0 = millis();
+  while (!udp.parsePacket()) {
+    if (millis() - t0 > 1500) return 0; // timeout ~1.5s
+  }
+  udp.read(pkt, 48);
+  udp.stop();
+  // NTP time starts 1900-01-01; UNIX starts 1970-01-01
+  const unsigned long seventyYears = 2208988800UL;
+  unsigned long secsSince1900 =
+      (unsigned long)pkt[40] << 24 | (unsigned long)pkt[41] << 16 |
+      (unsigned long)pkt[42] << 8  | (unsigned long)pkt[43];
+  return secsSince1900 - seventyYears; // UNIX epoch seconds
+}
+
+// Helper: append a uint64_t to an Arduino String
+static inline void appendUint64(String &s, uint64_t v) {
+  char buf[21];                          // enough for 20 digits + NUL
+  snprintf(buf, sizeof(buf), "%llu", (unsigned long long)v);
+  s += buf;
+}
+
 bool connectNetwork() {
   Serial.println("Attaching cellular...");
   // Pass APN credentials here (correct for MKRNB)
@@ -162,6 +195,11 @@ bool connectNetwork() {
     if (nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS) == NB_READY) {
       if (gprs.attachGPRS() == GPRS_READY) {
         Serial.println("Cellular attached.");
+
+        unsigned long unixNow = ntpUnix();
+        if (unixNow) {
+          rtc.setEpoch(unixNow);  // now rtc.getEpoch() is real UTC seconds
+        }
         return true;
       }
     }
@@ -172,8 +210,9 @@ bool connectNetwork() {
 }
 
 bool connectMQTT() {
-  Serial.println("Connecting MQTT...");
-  mqtt.setId(DEVICE_ID);
+  Serial.println("Connecting MQTT (ThingsBoard)...");
+  mqtt.setId(DEVICE_ID);                  // optional clientId
+  mqtt.setUsernamePassword(TB_TOKEN, ""); // TB: username = token, password blank
   if (!mqtt.connect(MQTT_HOST, MQTT_PORT)) {
     Serial.print("MQTT connect failed, code=");
     Serial.println(mqtt.connectError());
@@ -183,43 +222,77 @@ bool connectMQTT() {
   return true;
 }
 
+
 void publishBuffer() {
   if (headIdx == tailIdx) {
     Serial.println("No data to send.");
     return;
   }
 
-  // Compact JSON batch
+  // (Optional) quick sanity guard: if RTC isn't synced, fall back to server time.
+  // Remove this block if you're sure RTC is always synced.
+  if (rtc.getEpoch() < 1700000000UL) { // ~Nov 2023
+    Serial.println("RTC not synced; sending without explicit timestamps (server time).");
+    String payload = "[";
+    size_t i = tailIdx;
+    bool first = true;
+    while (i != headIdx) {
+      if (!first) payload += ',';
+      payload += "{\"values\":{";
+      payload += "\"a\":"; payload += buf[i].analog;
+      payload += ",\"c\":"; payload += buf[i].tips;
+      payload += "}}";
+      first = false;
+      i = (i + 1) % BUF_MAX;
+    }
+    payload += "]";
+
+    Serial.print("Publishing "); Serial.print(payload.length()); Serial.println(" bytes (server-timed)");
+    if (mqtt.beginMessage(MQTT_TOPIC, false, 1)) {
+      mqtt.print(payload);
+      mqtt.endMessage();
+      tailIdx = headIdx;
+      Serial.println("Publish OK");
+    } else {
+      Serial.println("Publish beginMessage() failed");
+    }
+    return;
+  }
+
+  // Build TB array payload with per-sample timestamps
   String payload;
-  payload.reserve(512);
-  size_t from = tailIdx, to = headIdx;
-  uint32_t interval = SAMPLE_INTERVAL_SEC;
-  uint32_t t0 = buf[from].ts;
+  payload.reserve(1024);            // adjust if you batch a lot of samples
+  payload += "[";
 
-  payload += "{\"dev\":\""; payload += DEVICE_ID;
-  payload += "\",\"int\":"; payload += interval;
-  payload += ",\"n\":"; payload += (to >= from ? (to - from) : (BUF_MAX - from + to));
-  payload += ",\"t0\":"; payload += t0;
-  payload += ",\"a\":[";
+  size_t i = tailIdx;
   bool first = true;
-  size_t i = from;
-  while (i != to) { if (!first) payload += ','; payload += buf[i].analog; first = false; i = (i + 1) % BUF_MAX; }
-  payload += "],\"c\":[";
-  first = true; i = from;
-  while (i != to) { if (!first) payload += ','; payload += buf[i].tips;   first = false; i = (i + 1) % BUF_MAX; }
-  payload += "]}";
+  while (i != headIdx) {
+    uint64_t ts_ms = (uint64_t)buf[i].ts * 1000ULL;   // ms since epoch
 
-  Serial.print("Publishing "); Serial.print(payload.length()); Serial.println(" bytes");  
+    if (!first) payload += ',';
+    payload += "{\"ts\":";
+    appendUint64(payload, ts_ms);
+    payload += ",\"values\":{";
+    payload += "\"a\":"; payload += buf[i].analog;     // analog reading
+    payload += ",\"c\":"; payload += buf[i].tips;      // rain tips in interval
+    payload += "}}";
+    first = false;
 
-  if (mqtt.beginMessage(MQTT_TOPIC, false, 1)) { // retained=false, QoS 1
+    i = (i + 1) % BUF_MAX;
+  }
+  payload += "]";
+
+  Serial.print("Publishing "); Serial.print(payload.length()); Serial.println(" bytes (TB timestamps)");
+  if (mqtt.beginMessage("v1/devices/me/telemetry", false, 1)) { // retained=false, QoS 1
     mqtt.print(payload);
     mqtt.endMessage();
-    tailIdx = to; // advance if OK
+    tailIdx = headIdx;              // advance buffer on success
     Serial.println("Publish OK");
   } else {
     Serial.println("Publish beginMessage() failed");
   }
 }
+
 
 void sleepFor(uint32_t seconds) {
   if (seconds == 0) return;

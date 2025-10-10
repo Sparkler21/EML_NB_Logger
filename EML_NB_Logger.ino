@@ -12,6 +12,7 @@
 #include <Wire.h>
 #include <Adafruit_ADS1X15.h>
 #include <NBUDP.h>
+#include <RTCZero.h>
 
 // ===================== User config =====================
 #define DEVICE_ID   "EML_HPT_001"
@@ -49,11 +50,13 @@ GPRS gprs;
 NBClient nbClient;           // non-TLS socket for MQTT :1883
 MqttClient mqtt(nbClient);
 NBUDP udp;
+RTCZero rtc;
 
 // ---- Monotonic, NTP-anchored clock (no RTC stalls) ----
 static uint32_t unix_base = 0;   // UTC seconds at last sync
 static uint32_t ms_base   = 0;   // millis() at last sync
 static bool     time_synced = false;
+volatile bool rtc_ready = false;   // becomes true after first NTP sync
 
 static inline void setUnixTime(uint32_t unix_now) {
   if (unix_now == 0) return;
@@ -63,37 +66,101 @@ static inline void setUnixTime(uint32_t unix_now) {
 }
 
 static inline uint32_t nowUnix() {
-  if (!time_synced) return millis() / 1000UL; // relative, safe before sync
-  return unix_base + (millis() - ms_base) / 1000UL;
-}
-
-// NTP (UDP) → UNIX seconds; 0 on failure
-unsigned long ntpUnix() {
-  const char* host = "pool.ntp.org";
-  const int NTP_PORT = 123;
-  uint8_t pkt[48] = {0};
-  pkt[0] = 0b11100011; // LI=3, VN=4, Mode=3 (client)
-
-  if (udp.begin(2390) != 1) return 0;
-  if (!udp.beginPacket(host, NTP_PORT)) { udp.stop(); return 0; }
-  udp.write(pkt, 48);
-  udp.endPacket();
-
-  unsigned long t0 = millis();
-  while (!udp.parsePacket()) {
-    if (millis() - t0 > 2000) { udp.stop(); return 0; }
+  if (rtc_ready) {
+    return rtc.getEpoch();          // UTC seconds from RTC once set
+  } else {
+    // pre-sync fallback so code never blocks
+    return millis() / 1000UL;       // relative seconds since boot
   }
-  udp.read(pkt, 48);
-  udp.stop();
-
-  const unsigned long seventyYears = 2208988800UL; // NTP(1900)->UNIX(1970)
-  unsigned long secs1900 =
-    ((unsigned long)pkt[40] << 24) |
-    ((unsigned long)pkt[41] << 16) |
-    ((unsigned long)pkt[42] <<  8) |
-     (unsigned long)pkt[43];
-  return secs1900 - seventyYears;
 }
+
+// Robust NTP (UDP) → UNIX seconds; 0 on failure
+// - Tries multiple anycast NTP IPs (no DNS)
+// - Two attempts per server, with LPWA-friendly timeouts
+// - Random local UDP port; clean open/close to avoid socket clashes
+unsigned long ntpUnix() {
+  // Known-good anycast NTPs (IPv4)
+  static const char* NTP_IPS[] = {
+    "162.159.200.1",   // time.cloudflare.com
+    "216.239.35.0",    // time.google.com anycast
+    "216.239.35.4",    // time.google.com anycast
+    "129.250.35.250"   // NTT pool
+  };
+  static const uint8_t N_NTP_IPS = sizeof(NTP_IPS)/sizeof(NTP_IPS[0]);
+
+  const uint16_t NTP_PORT = 123;
+  const unsigned long RECV_TIMEOUT_MS = 4000;   // LPWA: allow up to 4s for a reply
+  const unsigned long BETWEEN_TRIES_MS = 200;
+
+  // NTP request packet
+  uint8_t pkt[48] = {0};
+  pkt[0] = 0b11100011; // LI=3 (unsync), VN=4, Mode=3 (client)
+
+  // Ensure a clean UDP socket and choose a random-ish local port
+  udp.stop();
+  uint16_t localPort = 20000 + (millis() % 20000);
+  if (udp.begin(localPort) != 1) {
+    Serial.println("NTP: UDP begin failed");
+    return 0;
+  }
+
+  for (uint8_t s = 0; s < N_NTP_IPS; ++s) {
+    for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+      // Start a fresh packet to the current server
+      if (!udp.beginPacket(NTP_IPS[s], NTP_PORT)) {
+        delay(BETWEEN_TRIES_MS);
+        continue;
+      }
+      udp.write(pkt, sizeof(pkt));
+      udp.endPacket();
+
+      // Wait for response (single packet is enough)
+      unsigned long t0 = millis();
+      while (!udp.parsePacket()) {
+        if (millis() - t0 > RECV_TIMEOUT_MS) break;
+      }
+
+      if (udp.available() >= 48) {
+        uint8_t rb[48];
+        int n = udp.read(rb, sizeof(rb));
+        // Close ASAP to free socket
+        udp.stop();
+
+        if (n >= 48) {
+          // Transmit Timestamp (seconds since 1900) at bytes 40..43
+          unsigned long secs1900 =
+            ((unsigned long)rb[40] << 24) |
+            ((unsigned long)rb[41] << 16) |
+            ((unsigned long)rb[42] <<  8) |
+             (unsigned long)rb[43];
+
+          const unsigned long NTP_TO_UNIX = 2208988800UL; // 1900→1970
+          unsigned long unix = secs1900 - NTP_TO_UNIX;
+
+          // Sanity check: > 2005-01-01
+          if (unix > 1104537600UL) {
+            Serial.print("NTP OK from "); Serial.print(NTP_IPS[s]);
+            Serial.print(" → "); Serial.println(unix);
+            return unix;
+          }
+        }
+
+        // If we got here the packet was bad; reopen for next try
+        if (udp.begin(localPort) != 1) {
+          Serial.println("NTP: UDP re-begin failed");
+          return 0;
+        }
+      }
+
+      delay(BETWEEN_TRIES_MS);
+    }
+  }
+
+  // All attempts failed; close socket and report 0
+  udp.stop();
+  return 0;
+}
+
 
 // Ring buffer of minute samples
 struct Sample { uint32_t ts; int16_t riverLevel; uint16_t rain; };
@@ -104,9 +171,101 @@ size_t headIdx = 0, tailIdx = 0;
 // Helper: append uint64_t to Arduino String
 static inline void appendUint64(String &s, uint64_t v) {
   char b[21];
-  snprintf(b, sizeof(b), "%llu", (unsigned long long)v);
+  snprintf(b, sizeof(b), "%lu", (unsigned long long)v);
   s += b;
 }
+
+// ---- Coverage / registration helpers (use AT passthrough when available) ----
+
+// Parse +CSQ format (0..31 good; 99 = unknown/no signal).
+// Rough mapping: dBm ≈ -113 + 2*CSQ (legacy RSSI heuristic)
+static bool modemGetCSQ(int &csq, int &dbm) {
+  csq = 99; dbm = -999;
+#if defined(MODEM_H)
+  MODEM.begin();
+  // Clear any stale bytes
+  while (MODEM.available()) MODEM.read();
+
+  MODEM.println("AT+CSQ");
+  String resp;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 600) {
+    while (MODEM.available()) resp += (char)MODEM.read();
+  }
+  int p = resp.indexOf("+CSQ:");
+  if (p >= 0) {
+    int c, b;
+    if (sscanf(resp.c_str() + p, "+CSQ: %d,%d", &c, &b) == 2) {
+      csq = c;
+      if (csq >= 0 && csq <= 31) dbm = -113 + (csq * 2);
+      return true;
+    }
+  }
+#endif
+  return false;
+}
+
+// Read LTE registration: +CEREG: <n>,<stat> ...  stat: 1=registered (home), 5=registered(roaming)
+static bool modemGetCEREG(int &stat) {
+  stat = 0;
+#if defined(MODEM_H)
+  MODEM.begin();
+  while (MODEM.available()) MODEM.read();
+
+  MODEM.println("AT+CEREG?");
+  String resp;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 600) {
+    while (MODEM.available()) resp += (char)MODEM.read();
+  }
+  int p = resp.indexOf("+CEREG:");
+  if (p >= 0) {
+    // Handle formats like: +CEREG: 0,1  or +CEREG: 2,5,"...", ...
+    int n, s;
+    if (sscanf(resp.c_str() + p, "+CEREG: %d,%d", &n, &s) == 2) {
+      stat = s;
+      return true;
+    }
+  }
+#endif
+  return false;
+}
+
+// Wait for usable signal and/or registration before trying to attach.
+// minCSQ: e.g. 7 (~ -99 dBm) is a practical floor for NB/LTE-M.
+// If AT passthrough isn’t available, we just return true (can’t test).
+static bool waitForCoverage(uint8_t minCSQ, uint32_t timeoutMs) {
+#if !defined(MODEM_H)
+  // No AT passthrough available in this core build; skip gating.
+  return true;
+#else
+  unsigned long start = millis();
+  int lastDbm = -999, lastCsq = 99, reg = 0;
+  while (millis() - start < timeoutMs) {
+    modemGetCSQ(lastCsq, lastDbm);
+    modemGetCEREG(reg);
+
+    // Show a heartbeat every ~2s
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 2000) {
+      Serial.print("Signal CSQ="); Serial.print(lastCsq);
+      Serial.print(" ("); Serial.print(lastDbm); Serial.print(" dBm)");
+      Serial.print("  CEREG="); Serial.println(reg);
+      lastPrint = millis();
+    }
+
+    // Accept if registered and CSQ meets threshold (or CSQ unavailable but registered)
+    bool registered = (reg == 1 || reg == 5);
+    bool okSignal   = (lastCsq != 99 && lastCsq >= (int)minCSQ);
+    if (registered && okSignal) return true;
+
+    delay(500);
+  }
+  Serial.println("Coverage check: insufficient signal/registration this cycle.");
+  return false;
+#endif
+}
+
 
 // ISR for rain tips (debounced)
 void rainISR() {
@@ -187,7 +346,15 @@ void loop() {
     }
     lastPublishTs = nowUnix();
   }
-
+  static uint32_t lastNtp = 0;
+  if (rtc_ready && (now - lastNtp) >= 86400UL) {   // every 24h
+    unsigned long t = ntpUnix();
+    if (t) {
+      rtc.setEpoch(t);
+      Serial.print("RTC re-synced: "); Serial.println(t);
+    }
+  lastNtp = now;
+}
   // Light sleep
   // sleepFor(1);
   delay(1000);
@@ -236,6 +403,13 @@ bool connectNetwork() {
   const uint32_t ATTACH_TIMEOUT = 60000UL; // ~60 s for LTE-M
   unsigned long start = millis();
 
+// Quick pre-check: don’t even try to attach if there’s no signal/registration.
+// minCSQ 7 ≈ ~ -99 dBm (heuristic); adjust to taste (6..9). Timeout e.g. 30 s.
+if (!waitForCoverage(/*minCSQ*/7, /*timeoutMs*/30000)) {
+  // Skip this publish window; we’ll try again next loop.
+  return false;
+}
+
   while (millis() - start < ATTACH_TIMEOUT) {
     NB_NetworkStatus_t s = nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS);
     Serial.print("nbAccess.begin() -> "); Serial.println((int)s);
@@ -248,11 +422,23 @@ bool connectNetwork() {
         if (ip == IPAddress(0,0,0,0)) {
           Serial.println("No PDP IP yet, retrying...");
         } else {
-          if (!time_synced) {
-            unsigned long t = ntpUnix();
-            if (t) { setUnixTime(t); Serial.print("NTP synced: "); Serial.println(t); }
-            else   { Serial.println("NTP sync failed (will use server-time until next try)."); }
+        if (!rtc_ready) {
+          unsigned long t = ntpUnix();
+          if (t) {
+            // 1) keep your monotonic anchors (optional, if you still use them elsewhere)
+            setUnixTime(t);
+
+            // 2) start and set the RTC in UTC
+            rtc.begin();            // safe to call once after boot
+            rtc.setEpoch(t);        // set UTC seconds
+            rtc_ready = true;
+
+            Serial.print("NTP synced & RTC set: "); Serial.println(t);
+          } else {
+            Serial.println("NTP sync failed (using server-time until next try).");
           }
+        }
+
           cellAttached = true;
           Serial.println("Cellular attached.");
           return true;
@@ -261,6 +447,14 @@ bool connectNetwork() {
     }
     delay(2000);
   }
+
+  int csq, dbm, reg;
+  if (modemGetCSQ(csq, dbm) && modemGetCEREG(reg)) {
+    Serial.print("Pre-attach signal OK: CSQ="); Serial.print(csq);
+    Serial.print(" ("); Serial.print(dbm); Serial.print(" dBm), CEREG=");
+    Serial.println(reg);
+  }
+
 
   Serial.println("Cellular attach failed.");
   return false;
@@ -311,9 +505,48 @@ void publishOnceSimple() {
     Serial.println("Simple publish failed");
   }
 }
+/*
+void publishBuffer() {
+  if (headIdx == tailIdx) return;
+  size_t last = (headIdx + BUF_MAX - 1) % BUF_MAX;
 
+  if (!rtc_ready) {
+    Serial.println("RTC not set yet; sending simple server-timestamped object.");
+    publishOnceSimple();   // your existing function
+    return;
+  }
+  uint64_t ts_ms = (uint64_t)buf[i].ts * 1000ULL;
+
+  String msg = "[{\"ts\":";
+  appendUint64(msg, ts_ms);
+  msg += ",\"values\":{";
+  msg += "\"riverLevel\":";
+  msg += buf[last].riverLevel;
+  msg += ",\"rain\":";
+  msg += buf[last].rain;
+  msg += "}}]";
+
+  Serial.println("MQTT payload (simple):");
+  Serial.println(msg);
+
+  if (mqtt.beginMessage(TB_TOPIC, false, 0)) { // retained=false, QoS0
+    mqtt.print(msg);
+    mqtt.endMessage();
+    Serial.println("Simple publish OK");
+    // keep buffer (we'll still batch them later)
+  } else {
+    Serial.println("Simple publish failed");
+  }  
+}
+*/
 // Publish TB-native timestamped array
 void publishBuffer() {
+  if (!rtc_ready) {
+    Serial.println("RTC not set yet; sending simple server-timestamped object.");
+    publishOnceSimple();   // your existing function
+    return;
+  }
+
   if (headIdx == tailIdx) {
     Serial.println("No data to send.");
     return;

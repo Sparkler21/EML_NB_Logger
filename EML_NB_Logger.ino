@@ -12,6 +12,7 @@
 #include <Wire.h>
 #include <Adafruit_ADS1X15.h>
 #include <NBUDP.h>
+#include <ArduinoLowPower.h>
 #include <RTCZero.h>
 
 // ===================== User config =====================
@@ -171,7 +172,7 @@ size_t headIdx = 0, tailIdx = 0;
 // Helper: append uint64_t to Arduino String
 static inline void appendUint64(String &s, uint64_t v) {
   char b[21];
-  snprintf(b, sizeof(b), "%lu", (unsigned long long)v);
+  snprintf(b, sizeof(b), "%llu", (unsigned long long)v);
   s += b;
 }
 
@@ -266,9 +267,10 @@ static bool waitForCoverage(uint8_t minCSQ, uint32_t timeoutMs) {
 #endif
 }
 
+void rtcWakeISR() {}  // empty ISR; just wakes the MCU
 
 // ISR for rain tips (debounced)
-void rainISR() {
+void rainWakeISR() {
   uint32_t t = micros();
   if (t - lastPulseUs > 5000) { // ~5 ms debounce
     rainTipsCounter++;
@@ -293,6 +295,9 @@ void setup() {
   // Faster socket ops so connect() doesn't hang forever
   nbClient.setTimeout(30000); // 30 s
 
+  // Start RTC (needed for timed wake)
+  rtc.begin();
+  rtc.enableAlarm(rtc.MATCH_SS); 
   // ADS1115
   Wire.begin();
   if (!ads.begin()) {
@@ -304,7 +309,10 @@ void setup() {
 
   // Rain input
   pinMode(PIN_RAIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_RAIN), rainISR, FALLING);
+  // Allow wake on rain contact (D7 -> FALLING to GND)
+  LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
+  // Wake on RTC alarm (minute boundary)
+  LowPower.attachInterruptWakeup(RTC_ALARM_WAKEUP, rtcWakeISR, CHANGE);
 
   // Optional RAT selection (if core exposes it)
   #ifdef RADIO_ACCESS_TECHNOLOGY_NBIOT
@@ -316,49 +324,50 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastSample = 0;
+  static uint32_t lastMinute = UINT32_MAX;   // sentinel so first run samples
   static uint32_t lastPublishTs = 0;
 
-  uint32_t now = nowUnix();
+  uint32_t now = rtc.getEpoch();
+  uint32_t thisMinute = now / 60;
 
-  if ((now - lastSample) >= SAMPLE_INTERVAL_SEC || lastSample == 0) {
+  // If a new minute tick (woke from RTC), take the sample immediately
+  if (thisMinute != lastMinute) {
     takeSample();
-    lastSample = now;
+    lastMinute = thisMinute;
   }
 
-  bool timeToPublish = (lastPublishTs == 0) || ((now - lastPublishTs) >= PUBLISH_INTERVAL_SEC);
+  // Decide whether to publish on your 10-minute cadence
+  bool timeToPublish = (lastPublishTs == 0) ||
+                       ((now - lastPublishTs) >= PUBLISH_INTERVAL_SEC);
 
   if (timeToPublish) {
-    if (connectNetwork()) {
-      if (connectMQTT_IP()) {
-        if (!time_synced) {
-          // First cycle (or after loss of time): send simple object
-          publishOnceSimple();
-        } else {
-          // Normal: send full timestamped batch
-          publishBuffer();
-        }
-        mqtt.stop();
+    if (connectNetwork() && connectMQTT_IP()) {
+      if (!time_synced) {
+        publishOnceSimple();   // TB timestamps it
+      } else {
+        publishBuffer();       // uses device ts (ms)
       }
-      // Stay attached for reliability/power — do NOT detach/shutdown here
-      // gprs.detachGPRS();
-      // nbAccess.shutdown();
+      mqtt.stop();
+      lastPublishTs = rtc.getEpoch();
     }
-    lastPublishTs = nowUnix();
   }
+
+  // Optional: daily NTP re-sync
   static uint32_t lastNtp = 0;
-  if (rtc_ready && (now - lastNtp) >= 86400UL) {   // every 24h
-    unsigned long t = ntpUnix();
-    if (t) {
-      rtc.setEpoch(t);
-      Serial.print("RTC re-synced: "); Serial.println(t);
-    }
-  lastNtp = now;
+  if (time_synced && (now - lastNtp) >= 86400UL) {
+    if (unsigned long t = ntpUnix()) { rtc.setEpoch(t); }
+    lastNtp = now;
+  }
+
+  // Sleep exactly until the next minute boundary (or wake early on rain)
+  Serial.println("Sleep!");
+  sleepUntilNextMinute();
+
+  // If we woke early due to a rain tip interrupt, just loop; the guard
+  // above will only re-sample when the minute actually changes.
 }
-  // Light sleep
-  // sleepFor(1);
-  delay(1000);
-}
+
+
 
 // ===================== Helpers =====================
 
@@ -384,6 +393,19 @@ void takeSample() {
   Serial.print(" riverLevel="); Serial.print(adc);
   Serial.print(" rain="); Serial.println(tips);
 }
+
+void scheduleNextMinuteAlarm() {
+//  uint32_t t    = rtc.getEpoch();
+//  uint32_t next = ((t / 60) + 1) * 60;   // next multiple of 60 seconds
+//  uint8_t h = (next / 3600) % 24;
+//  uint8_t m = (next / 60) % 60;
+//  uint8_t s = next % 60;                 // will be 0
+
+//  rtc.setAlarmTime(h, m, s);
+//  rtc.enableAlarm(rtc.MATCH_HHMMSS);     // alarm at exact H:M:S
+//  rtc.enableAlarm(rtc.MATCH_SS);     // alarm at exact H:M:S
+}
+
 
 // Network attach + one-shot NTP sync if needed
 bool connectNetwork() {
@@ -563,7 +585,8 @@ void publishBuffer() {
 
     if (!first) payload += ',';
     payload += "{\"ts\":";
-    appendUint64(payload, ts_ms);
+    payload += buf[i].ts;   // uint32_t seconds
+    payload += "000";       // ms
     payload += ",\"values\":{";
     payload += "\"riverLevel\":"; payload += buf[i].riverLevel;
     payload += ",\"rain\":";       payload += buf[i].rain;
@@ -588,8 +611,9 @@ void publishBuffer() {
   }
 }
 
-// Low-power helper (optional)
-void sleepFor(uint32_t seconds) {
-  if (seconds == 0) return;
-  delay(seconds * 1000UL); // swap for LowPower.deepSleep() later if needed
+void sleepUntilNextMinute() {
+  scheduleNextMinuteAlarm();
+  LowPower.deepSleep();  // sleeps until RTC alarm or rain interrupt
 }
+
+

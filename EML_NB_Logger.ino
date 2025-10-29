@@ -49,9 +49,11 @@ NBUDP Udp;
 Adafruit_ADS1115 ads;
 
 // Flags
+bool NTP_updatedFlag = false;
 volatile bool rtcWakeFlag = false;
 volatile bool rainWakeFlag = false;
 bool sendMsgFlag = false;
+bool goToSleepFlag = false;
 
 // Pins
 const int PIN_RAIN = 7;  // contact-closure input (to GND)
@@ -63,10 +65,14 @@ volatile uint32_t lastPulseUs = 0;
 
 // minute samples
 
+uint16_t riverLevelRange = 5000;
+
 uint8_t sampleNo = 0;
 uint16_t riverLevel = 0;
 uint16_t currentRiverLevel = 0;
 uint16_t riverLevelTotal = 0;
+uint16_t riverLevelMax = 0;
+uint16_t riverLevelMin = riverLevelRange;
 uint8_t rainInterval = 0;
 uint16_t rain24hr = 0; 
 
@@ -75,9 +81,16 @@ uint16_t currentSampleNo = 0;
 uint32_t tsSendValue = 0;
 uint16_t riverLevelAveSendValue = 0;
 uint16_t riverLevelMaxSendValue = 0;    //  This equals the minimum river level in mm.
-uint16_t riverLevelMinSendValue = 5000; //  This equals the maximum river level in mm.
+uint16_t riverLevelMinSendValue = riverLevelRange; //  This equals the maximum river level in mm.
 uint16_t rainIntervalSendValue = 0;
 uint16_t rain24hrSendValue = 0;
+
+uint8_t sampleYear;
+uint8_t sampleMonth;
+uint8_t sampleDay;
+uint8_t sampleHour;
+uint8_t sampleMinute;
+uint8_t sampleSecond;  
 
 ///////////////////////////////////////////////////////////
 //  Helper Functions
@@ -93,6 +106,7 @@ void setup()
 {
   #if ENABLE_DEBUG
     Serial.begin(115200);
+    delay(1000);
   #endif
 
   // Start peripherals
@@ -113,6 +127,7 @@ void setup()
     // connection state
   boolean connected = false;
 
+
   // After starting the modem with NB.begin()
   // attach the shield to the GPRS network with the APN, login and password
   while (!connected) {
@@ -132,8 +147,14 @@ void setup()
   Udp.begin(localPort);
 
   getNTP();
+  if(NTP_updatedFlag == false){
+    delay(10000);  //Wait 10seconds then try again...
+    getNTP();
+  }
 
   delay(3000);
+  rtcWakeFlag = false;  //  To avoid first false sample
+  goToSleepFlag = true;
 }
 
 ///////////////////////////////////////////////////////////
@@ -148,6 +169,7 @@ void loop()
       Serial.println("rtcWakeISR!");
     #endif
     // Sample Sensors
+    sampleTimeandDateFromRTC();
     takeSamples(currentSampleNo);
     // Store/calculate sensor values (SD CARD?)
 //    storeSamples(currentSampleNo);
@@ -162,16 +184,19 @@ void loop()
     //Increment currentSampleNo
     currentSampleNo++;  // Increment sample counter
     resetAlarms();
+    goToSleepFlag = true;
   }
 
   if(rainWakeFlag){  // Rain Sensor Alarm
     rainWakeFlag = false;
+
     #if ENABLE_DEBUG
-      Serial.println("rainWakeISR!");
-      Serial.print("rainCount:     "); Serial.println(rainTipsCounter);
-      Serial.print("rainCount24hr: "); Serial.println(rain24hrTipsCounter);
+      Serial.print("rainWakeISR!, ");
+      Serial.print("rainCount: "); Serial.print(rainTipsCounter);
+      Serial.print(", rainCount24hr: "); Serial.println(rain24hrTipsCounter);
     #endif
     resetAlarms();
+    goToSleepFlag = true;
   }
 
   if(sendMsgFlag){  //  Send Message
@@ -179,13 +204,27 @@ void loop()
     #if ENABLE_DEBUG
       Serial.println("sendMessage!");
     #endif  
-    rainTipsCounter = 0;
+
+    //  This is where we do the sample averaging and message creation!
+    calcSamples(currentSampleNo);
+    createJsonMsg();
+
+    //if this is midnight we need to set a flag to tell the next message loop to clear the 24hr counter!!!
+  
   }
 
     // Sleep!
-    delay(1000);
-    LowPower.idle();
+    if(goToSleepFlag){
+      #if ENABLE_DEBUG
+        Serial.println("Sleep!");
+        delay(100);
+      #endif
+      goToSleepFlag = false;  
+      LowPower.idle();
     //LowPower.deepSleep();
+    }
+
+
 }
 ///////////////////////////////////////////////////////////
 //  END OF LOOP
@@ -196,6 +235,16 @@ void loop()
 /****************************************************************/
 // Modem Connect Function
 
+//  Get sampling time from RTC
+void sampleTimeandDateFromRTC(){
+  sampleSecond = rtc.getSeconds();  
+  sampleMinute = rtc.getMinutes();
+  sampleHour = rtc.getHours();
+  sampleYear = rtc.getYear();
+  sampleMonth = rtc.getMonth();
+  sampleDay = rtc.getDay();
+}
+
 // Sample Function
 void takeSamples(uint16_t no_of_samples) {
   // Read River Level ADC(0)
@@ -203,21 +252,40 @@ void takeSamples(uint16_t no_of_samples) {
   currentRiverLevel = adc;  //  Need multipliers and offsets?
 
   riverLevelTotal = riverLevelTotal + currentRiverLevel;  //  Totalise the river level samples
+  if(riverLevelMax < currentRiverLevel){
+    riverLevelMax = currentRiverLevel;  //  New Max in the samples
+  }
+  if(riverLevelMin > currentRiverLevel){
+    riverLevelMin = currentRiverLevel;  //  New Min in the samples
+  }
 
   #if ENABLE_DEBUG
-    Serial.print(rtc.getYear()+2000); Serial.print("-"); Serial.print(rtc.getMonth()); Serial.print("-"); Serial.print(rtc.getDay());
+    Serial.print(sampleYear+2000); Serial.print("-"); Serial.print(sampleMonth); Serial.print("-"); Serial.print(sampleDay);
     Serial.print(" ");
-    Serial.print(rtc.getHours()); Serial.print(":"); Serial.print(rtc.getMinutes()); Serial.print(":"); Serial.print(rtc.getSeconds()); Serial.print(", ");
+    Serial.print(sampleHour); Serial.print(":"); Serial.print(sampleMinute); Serial.print(":"); Serial.print(sampleSecond); Serial.print(", ");
     Serial.print("Sample No = "); Serial.print(no_of_samples); Serial.print(", ");
-    Serial.print("currentRiverLevel = "); Serial.print(currentRiverLevel); Serial.print(", ");
+    Serial.print("RiverLevel-Current = "); Serial.print(currentRiverLevel); Serial.print(", ");
+    Serial.print("RiverLevel-Total = "); Serial.print(riverLevelTotal); Serial.print(", ");
+    Serial.print("RiverLevel-Max = "); Serial.print(riverLevelMax); Serial.print(", ");
+    Serial.print("RiverLevel-Min = "); Serial.print(riverLevelMin); Serial.print(", ");
     Serial.print("rainInterval = "); Serial.print(rainTipsCounter); Serial.print(", ");
     Serial.print("rain24hr = "); Serial.println(rain24hrTipsCounter);
   #endif
 }
 
 // Process Sensors Function (inc Rain Reset if day change?)
-void calcLogSamples(uint16_t no_of_samples){
-
+void calcSamples(uint16_t no_of_samples){
+  riverLevelAveSendValue = riverLevelTotal/no_of_samples;  //  Calculate the average river level during the sampling period
+  riverLevelMaxSendValue = riverLevelMax;
+  riverLevelMinSendValue = riverLevelMin;
+  rainIntervalSendValue = rainTipsCounter;
+  rain24hrSendValue = rain24hrTipsCounter;
+  tsSendValue = rtc.getEpoch();
+  rainTipsCounter = 0;
+  currentSampleNo = 0;
+  riverLevelTotal = 0;
+  riverLevelMax = 0;
+  riverLevelMin = riverLevelRange;
 }
 // Store Samples Data Function (SD Card)
 void storeSamples(uint16_t no_of_samples){
@@ -267,7 +335,7 @@ void getNTP()
   delay(1000);
   if ( Udp.parsePacket() ) {
     #if ENABLE_DEBUG
-      Serial.println("packet received");
+      Serial.println("NTP packet received");
     #endif
     // We've received a packet, read the data from it
     Udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
@@ -302,7 +370,9 @@ void getNTP()
       Serial.print(":");
       Serial.println(second());
     #endif
+    NTP_updatedFlag = true;  // Time has been set
   }
+
   // wait ten seconds before asking for the time again
 //  delay(10000);
 }

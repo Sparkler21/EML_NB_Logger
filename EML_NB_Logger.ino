@@ -3,12 +3,49 @@
   - ADS1115 (AIN0) for river level
   - Rain gauge on D7 (contact to GND), debounced in ISR
   - Sample every 60 s, publish every 10 min
+
+Notes on Ultrasonic Level Sensor:  XL-MaxSonar-WR/WRC Pin Out 
+
+Pin 1- Leave open (or high) for serial output on the Pin 5 output. When Pin 1 is held low the Pin 5 output sends a pulse 
+(instead of serial data), suitable for low noise chaining. 
+
+Pin 2- This pin outputs a pulse-width representation of range. To calculate the distance, use a scale factor of 58uS per cm. 
+(MB7051, MB7052, MB7053, MB7054, MB7060, MB7062, MB7066) 
+This pin outputs the analog voltage envelope of the acoustic waveform. For the MB7070 series and MB7092 sensors, this 
+is a real-time always-active output (MB7070, MB7072, MB7076, MB7092, MB7150, MB7155) 
+
+Pin 3- AN-This pin outputs analog voltage with a scaling factor of (Vcc/1024) per cm. A supply of 5V yields ~4.9mV/
+cm., and 3.3V yields ~3.2mV/cm. Hardware limits the maximum reported range on this output to ~700 cm at 5V and ~600 
+cm at 3.3V. The output is buffered and corresponds to the most recent range data. 
+For the 10-meter sensors (MB7051, MB7053, MB7054, MB7066, MB7076) Pin 3 outputs an analog voltage with a 
+scaling of (Vcc/1024) per 2-cm. A supply of 5V yields ~4.9mV/2-cm., and 3.3V yields ~3.2mV/2-cm. This Analog 
+Voltage output steps in 2-cm increments. 
+
+Pin 4- RX- This pin is internally pulled high. If Pin-4 is left unconnected or held high, the sensor will continually measure 
+the range. If Pin-4 is held low the sensor will stop ranging. Bring high 20uS or more to command a range reading.
+
+Pin 5- TX- When Pin 1 is open or held high, the Pin 5 output delivers asynchronous serial data in an RS232* format, 
+except the voltages are 0-Vcc. The output is an ASCII capital “R”, followed by ASCII character digits representing the 
+range in centimeters up to a maximum of 765 (select models) or 1068 (select models), followed by a carriage return 
+(ASCII 13). The baud rate is 9600, 8 bits, no parity, with one stop bit. Although the voltages of 0V to Vcc are outside the 
+RS232* standard, most RS232* devices have sufficient margin to read the 0V to Vcc serial data. If standard voltage level 
+RS232* is desired, invert, and connect an RS23* converter such as a MAX232.When Pin 1 is held low, the Pin 5 output 
+sends a single pulse, suitable for low noise chaining (no serial data). 
+
+*The MB7150 & MB7155 are TTL output format (inverted RS232) and follow the same ASCII data structure 
+
+V+ Operates on 3V - 5.5V. The average (and peak) current draw for 3.3V operation is 2.1mA (50mA peak) and 5V 
+operation is 3.4mA (100mA peak) respectively. Peak current is used during sonar pulse transmit. Please reference page 13 
+for minimum operating voltage verses temperature information.
+
+GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for best operation.
+
 */
 #include <MKRNB.h>
 #include <RTCZero.h>
 #include <ArduinoLowPower.h>
 #include <TimeLib.h>
-#include <Adafruit_ADS1X15.h>
+//#include <Adafruit_ADS1X15.h>
 #include <ArduinoMqttClient.h>
 /************************************************************
  * Enables debug support. To disable this feature set to 0.
@@ -16,15 +53,16 @@
 #define ENABLE_DEBUG                       1
 // ===================== User config =====================
 #define DEVICE_ID   "EML_HPT_001"
-
 // Your APN for LTE-M
 #define APN         "gigsky-02"
 #define APN_USER    ""
 #define APN_PASS    ""
 #define PINNUMBER   ""          // SIM PIN if any
 
-uint16_t riverLevelRange = 5000;
-float rainGaugeCF = 0.200;
+#define SENSORS_MODE 0  // 0 = Rain and River Level, 1 = Rain only, 2 = River Level only
+#define SAMPLING_INTERVAL 10  // SAMPLING_INTERVAL in minutes
+uint16_t riverLevelRange = 5000;  //  Currently Max range in mm
+float rainGaugeCF = 0.200;  //  Rain gauge calibration factor
 
 // ---- ThingsBoard EU MQTT ----
 const char TB_HOST[]   = "mqtt.eu.thingsboard.cloud"; // EU cluster
@@ -46,7 +84,7 @@ NBClient nbClient;
 MqttClient mqttClient(nbClient);
 // A UDP instance to let us send and receive packets over UDP
 NBUDP Udp;
-Adafruit_ADS1115 ads;
+//Adafruit_ADS1115 ads;
 
 // Flags
 bool NTP_updatedFlag = false;
@@ -104,8 +142,8 @@ void setup()
   #endif
 
   // Start peripherals
-  Wire.begin();
-  ads.begin(); 
+  //Wire.begin();
+  //ads.begin(); 
   rtc.begin(); // initialize RTC 24H format
 
 //  NEED AN RTC SAFETY NET HERE OR SOMEWHERE FOR FAILED NTP
@@ -115,12 +153,13 @@ void setup()
   rtc.attachInterrupt(rtcWakeISR);
 
 // Rain input
-  pinMode(PIN_RAIN, INPUT_PULLUP);
-  LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
-
+    pinMode(PIN_RAIN, INPUT_PULLUP);
+    LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
     // connection state
   boolean connected = false;
 
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
 
   // After starting the modem with NB.begin()
   // attach the shield to the GPRS network with the APN, login and password
@@ -163,6 +202,7 @@ void setup()
   #if ENABLE_DEBUG
     Serial.println("OK");
   #endif
+  flashLED(5, 100);
   delay(3000);
   rtcWakeFlag = false;  //  To avoid first false sample
   goToSleepFlag = true;
@@ -183,12 +223,16 @@ void loop()
       Serial.println("rtcWakeISR!");
     #endif
     // Sample Sensors
-    
-    takeSamples(currentSampleNo);
+    if(SENSORS_MODE == 0 || SENSORS_MODE == 2){  //River Level
+      takeRiverLevelSamples(currentSampleNo);
+    }
+    if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
+      takeRainSamples(currentSampleNo);
+    }
     // Store/calculate sensor values (SD CARD?)
 //    storeSamples(currentSampleNo);
     //See if 10minute period has arrived?
-    int modTest = rtc.getMinutes()%2;  //  Divide by 2 instead of 10 for testing
+    int modTest = rtc.getMinutes()%SAMPLING_INTERVAL;  //  10min
     if(modTest == 0){
       sendMsgFlag = true;
       #if ENABLE_DEBUG
@@ -197,20 +241,23 @@ void loop()
     }
     //Increment currentSampleNo
     currentSampleNo++;  // Increment sample counter
+
     resetAlarms();
     goToSleepFlag = true;
   }
 
-  if(rainWakeFlag){  // Rain Sensor Alarm
-    rainWakeFlag = false;
+  if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
+    if(rainWakeFlag){  // Rain Sensor Alarm
+      rainWakeFlag = false;
 
-    #if ENABLE_DEBUG
-      Serial.print("rainWakeISR!, ");
-      Serial.print("rainCount: "); Serial.print(rainTipsCounter);
-      Serial.print(", rainCount24hr: "); Serial.println(rain24hrTipsCounter);
-    #endif
-    resetAlarms();
-    goToSleepFlag = true;
+      #if ENABLE_DEBUG
+        Serial.print("rainWakeISR!, ");
+        Serial.print("rainCount: "); Serial.print(rainTipsCounter);
+        Serial.print(", rainCount24hr: "); Serial.println(rain24hrTipsCounter);
+      #endif
+      resetAlarms();
+      goToSleepFlag = true;
+    }
   }
 
   if(sendMsgFlag){  //  Send Message
@@ -221,10 +268,12 @@ void loop()
 
     //  This is where we do the sample averaging and message creation!
     calcSamples(currentSampleNo);
-    createAndSendJsonMsg();
+    createAndSendJsonMsg(); 
 
-    //if this is midnight we need to set a flag to tell the next message loop to clear the 24hr counter!!!
-  
+    //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
+    if(sampleHour == 0 && sampleMinute == 0){
+      rain24hrTipsCounter = 0;
+    }
   }
 
     // Sleep!
@@ -260,11 +309,22 @@ void sampleTimeandDateFromRTC(){
 }
 
 // Sample Function
-void takeSamples(uint16_t no_of_samples) {
+void takeRiverLevelSamples(uint16_t no_of_samples) {
   // Read River Level ADC(0)
-  uint16_t adc = ads.readADC_SingleEnded(0);
-  currentRiverLevel = adc;  //  Need multipliers and offsets?
+  uint32_t adc = 0;
+  const int N = 10;
+  
+  //POWER UP SENSOR
+  //SMALL DELAY of MORE THAN 20uS
+  for (int i = 0; i < N; i++) {
+    //adc = ads.readADC_SingleEnded(0);
+    adc = adc + analogRead(2);
+    delay(50); // small delay between samples
+  }
+  //SHUT DOWN SENSOR
 
+  currentRiverLevel = adc/N;  //  Need multipliers and offsets?
+  adc = 0;  // reset
   riverLevelTotal = riverLevelTotal + currentRiverLevel;  //  Totalise the river level samples
   if(riverLevelMax < currentRiverLevel){
     riverLevelMax = currentRiverLevel;  //  New Max in the samples
@@ -281,7 +341,17 @@ void takeSamples(uint16_t no_of_samples) {
     Serial.print("RiverLevel-Current = "); Serial.print(currentRiverLevel); Serial.print(", ");
     Serial.print("RiverLevel-Total = "); Serial.print(riverLevelTotal); Serial.print(", ");
     Serial.print("RiverLevel-Max = "); Serial.print(riverLevelMax); Serial.print(", ");
-    Serial.print("RiverLevel-Min = "); Serial.print(riverLevelMin); Serial.print(", ");
+    Serial.print("RiverLevel-Min = "); Serial.println(riverLevelMin);
+  #endif
+}
+
+void takeRainSamples(uint16_t no_of_samples) {
+
+  #if ENABLE_DEBUG
+    Serial.print(sampleYear+2000); Serial.print("-"); Serial.print(sampleMonth); Serial.print("-"); Serial.print(sampleDay);
+    Serial.print(" ");
+    Serial.print(sampleHour); Serial.print(":"); Serial.print(sampleMinute); Serial.print(":"); Serial.print(sampleSecond); Serial.print(", ");
+    Serial.print("Sample No = "); Serial.print(no_of_samples); Serial.print(", ");
     Serial.print("rainInterval = "); Serial.print(rainTipsCounter); Serial.print(", ");
     Serial.print("rain24hr = "); Serial.println(rain24hrTipsCounter);
   #endif
@@ -289,16 +359,22 @@ void takeSamples(uint16_t no_of_samples) {
 
 // Process Sensors Function (inc Rain Reset if day change?)
 void calcSamples(uint16_t no_of_samples){
-  riverLevelAveSendValue = riverLevelTotal/no_of_samples;  //  Calculate the average river level during the sampling period
-  riverLevelMaxSendValue = riverLevelMax;
-  riverLevelMinSendValue = riverLevelMin;
-  rainIntervalSendValue = rainTipsCounter * rainGaugeCF;
-  rain24hrSendValue = rain24hrTipsCounter * rainGaugeCF;
-  rainTipsCounter = 0;
+
+  if(SENSORS_MODE == 0 || SENSORS_MODE == 2){  //River Level
+    riverLevelAveSendValue = riverLevelTotal/no_of_samples;  //  Calculate the average river level during the sampling period
+    riverLevelMaxSendValue = riverLevelMax;
+    riverLevelMinSendValue = riverLevelMin;
+    riverLevelTotal = 0;
+    riverLevelMax = 0;
+    riverLevelMin = riverLevelRange;
+  }
+
+  if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
+    rainIntervalSendValue = rainTipsCounter * rainGaugeCF;
+    rain24hrSendValue = rain24hrTipsCounter * rainGaugeCF;
+    rainTipsCounter = 0;
+  }
   currentSampleNo = 0;
-  riverLevelTotal = 0;
-  riverLevelMax = 0;
-  riverLevelMin = riverLevelRange;
 }
 // Store Samples Data Function (SD Card)
 void storeSamples(uint16_t no_of_samples){
@@ -314,48 +390,72 @@ void createAndSendJsonMsg(){
   String payload;
   payload.reserve(2048);
 
-  payload += "[";
-  payload += "{\"ts\":";
-  payload += tsSendValue;   // uint32_t seconds
-  payload += "000";       // ms
-  payload += ",\"values\":";
-  payload += "{";
-  payload += "\"device\":\"";
-  payload += DEVICE_ID;
-  payload += "\",";
-/*  payload += "\"date\":\"";
-  payload += sampleDay;
-  payload += "-";
-  payload += sampleMonth;
-  payload += "-";
-  payload += sampleYear;
-  payload += "\",";
-    payload += "\"time\":\"";
-  payload += sampleHour;
-  payload += ":";
-  payload += sampleMinute;
-  payload += ":";
-  payload += sampleSecond;
-  payload += "\",";*/
-  payload += "\"riverLevelAve\":";
-  payload += riverLevelAveSendValue;
-  payload += ",\"riverLevelMax\":";
-  payload += riverLevelMaxSendValue;
-  payload += ",\"riverLevelMin\":";
-  payload += riverLevelMinSendValue;
-  payload += ",\"rainInt\":";
-  payload += rainIntervalSendValue;
-  payload += ",\"rain24hr\":";
-  payload += rain24hrSendValue;
-  payload += "}}";
-  payload += "]";
-
+  if(SENSORS_MODE == 0){  //Rain and River Level
+    payload += "[";
+    payload += "{\"ts\":";
+    payload += tsSendValue;   // uint32_t seconds
+    payload += "000";       // ms
+    payload += ",\"values\":";
+    payload += "{";
+    payload += "\"device\":\"";
+    payload += DEVICE_ID;
+    payload += "\",";
+    payload += "\"riverLevelAve\":";
+    payload += riverLevelAveSendValue;
+    payload += ",\"riverLevelMax\":";
+    payload += riverLevelMaxSendValue;
+    payload += ",\"riverLevelMin\":";
+    payload += riverLevelMinSendValue;
+    payload += ",\"rainInt\":";
+    payload += rainIntervalSendValue;
+    payload += ",\"rain24hr\":";
+    payload += rain24hrSendValue;
+    payload += "}}";
+    payload += "]";
+  }
+  if(SENSORS_MODE == 1){  //Rain only
+    payload += "[";
+    payload += "{\"ts\":";
+    payload += tsSendValue;   // uint32_t seconds
+    payload += "000";       // ms
+    payload += ",\"values\":";
+    payload += "{";
+    payload += "\"device\":\"";
+    payload += DEVICE_ID;
+    payload += "\",";
+    payload += "\"rainInt\":";
+    payload += rainIntervalSendValue;
+    payload += ",\"rain24hr\":";
+    payload += rain24hrSendValue;
+    payload += "}}";
+    payload += "]";
+  }
+  if(SENSORS_MODE == 2){  //River Level only
+    payload += "[";
+    payload += "{\"ts\":";
+    payload += tsSendValue;   // uint32_t seconds
+    payload += "000";       // ms
+    payload += ",\"values\":";
+    payload += "{";
+    payload += "\"device\":\"";
+    payload += DEVICE_ID;
+    payload += "\",";
+    payload += "\"riverLevelAve\":";
+    payload += riverLevelAveSendValue;
+    payload += ",\"riverLevelMax\":";
+    payload += riverLevelMaxSendValue;
+    payload += ",\"riverLevelMin\":";
+    payload += riverLevelMinSendValue;
+    payload += "}}";
+    payload += "]";
+  }
   mqttClient.beginMessage(TB_TOPIC);
   mqttClient.print(payload);
   mqttClient.endMessage();
 
   #if ENABLE_DEBUG
     Serial.print("Sent: "); Serial.println(payload);
+    flashLED(1, 2000);
   #endif
 }
 
@@ -442,6 +542,16 @@ unsigned long sendNTPpacket(IPAddress& address)
   //Serial.println("6");
 }
 
+void flashLED(uint8_t no_of_flashes, uint16_t delay_time)
+{
+  for (int i = 0; i < no_of_flashes; i++){
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(delay_time);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(delay_time);
+  }
+}
+
 // Interrupt Functions
 void rtcWakeISR()
 {
@@ -451,11 +561,13 @@ void rtcWakeISR()
 // Rain Interrupt function
 // ISR for rain tips (debounced)
 void rainWakeISR() {
-  uint32_t t = micros();
-  rainWakeFlag = true;
-  if (t - lastPulseUs > 10000) { // ~10 ms debounce
-    rainTipsCounter++;
-    rain24hrTipsCounter++;
-    lastPulseUs = t;
+  if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
+    uint32_t t = micros();
+    rainWakeFlag = true;
+    if (t - lastPulseUs > 10000) { // ~10 ms debounce
+      rainTipsCounter++;
+      rain24hrTipsCounter++;
+      lastPulseUs = t;
+    }
   }
 }

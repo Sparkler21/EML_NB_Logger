@@ -4,19 +4,16 @@
   - Rain gauge on D7 (contact to GND), debounced in ISR
   - Sample every 60 s, publish every 10 min
 */
-
 #include <MKRNB.h>
 #include <RTCZero.h>
 #include <ArduinoLowPower.h>
 #include <TimeLib.h>
 #include <Adafruit_ADS1X15.h>
-
-/**********************************************
- * Enables debug support. To disable this
- * feature set to 0.
- **********************************************/
+#include <ArduinoMqttClient.h>
+/************************************************************
+ * Enables debug support. To disable this feature set to 0.
+ ***********************************************************/
 #define ENABLE_DEBUG                       1
-
 // ===================== User config =====================
 #define DEVICE_ID   "EML_HPT_001"
 
@@ -26,15 +23,16 @@
 #define APN_PASS    ""
 #define PINNUMBER   ""          // SIM PIN if any
 
-// ThingsBoard MQTT (EU) — using IPs to skip DNS on LPWA
-const char* MQTT_IPS[] = { "3.127.14.137", "18.196.252.195", "63.176.17.51" };
-const uint8_t N_MQTT_IPS = sizeof(MQTT_IPS)/sizeof(MQTT_IPS[0]);
-const int     MQTT_PORT  = 1883;                 // plain MQTT
+uint16_t riverLevelRange = 5000;
+float rainGaugeCF = 0.200;
+
+// ---- ThingsBoard EU MQTT ----
+const char TB_HOST[]   = "mqtt.eu.thingsboard.cloud"; // EU cluster
+const int  TB_PORT    = 1883;
 const char*   TB_TOPIC   = "v1/devices/me/telemetry";
-const char*   TB_TOKEN   = "uo423fza9leqz4pry7cb"; // username for MQTT
+const char*   TB_TOKEN   = "uo423fza9leqz4pry7cb"; // username for MQTT - Token on TB
 
 // =======================================================
-
 IPAddress timeServer(129, 6, 15, 28); // time.nist.gov NTP server
 const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
 byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
@@ -44,6 +42,8 @@ unsigned int localPort = 2390;      // local port to listen for UDP packets
 RTCZero rtc;
 GPRS gprs;
 NB nbAccess;
+NBClient nbClient;
+MqttClient mqttClient(nbClient);
 // A UDP instance to let us send and receive packets over UDP
 NBUDP Udp;
 Adafruit_ADS1115 ads;
@@ -64,9 +64,6 @@ volatile uint32_t rain24hrTipsCounter = 0;
 volatile uint32_t lastPulseUs = 0;
 
 // minute samples
-
-uint16_t riverLevelRange = 5000;
-
 uint8_t sampleNo = 0;
 uint16_t riverLevel = 0;
 uint16_t currentRiverLevel = 0;
@@ -75,16 +72,13 @@ uint16_t riverLevelMax = 0;
 uint16_t riverLevelMin = riverLevelRange;
 uint8_t rainInterval = 0;
 uint16_t rain24hr = 0; 
-
 uint16_t currentSampleNo = 0;
-
 uint32_t tsSendValue = 0;
 uint16_t riverLevelAveSendValue = 0;
 uint16_t riverLevelMaxSendValue = 0;    //  This equals the minimum river level in mm.
 uint16_t riverLevelMinSendValue = riverLevelRange; //  This equals the maximum river level in mm.
-uint16_t rainIntervalSendValue = 0;
-uint16_t rain24hrSendValue = 0;
-
+float rainIntervalSendValue = 0;
+float rain24hrSendValue = 0;
 uint8_t sampleYear;
 uint8_t sampleMonth;
 uint8_t sampleDay;
@@ -131,7 +125,7 @@ void setup()
   // After starting the modem with NB.begin()
   // attach the shield to the GPRS network with the APN, login and password
   while (!connected) {
-    if ((nbAccess.begin(PINNUMBER) == NB_READY) &&
+    if ((nbAccess.begin(PINNUMBER, APN) == NB_READY) &&
         (gprs.attachGPRS() == GPRS_READY)) {
       connected = true;
     } else {
@@ -152,6 +146,18 @@ void setup()
     getNTP();
   }
 
+  mqttClient.setId(DEVICE_ID);
+  // Auth: token as username, empty password
+  mqttClient.setUsernamePassword(TB_TOKEN, "");
+
+  Serial.print("Connecting MQTT...");
+  if (!mqttClient.connect(TB_HOST, TB_PORT)) {
+    Serial.print(" failed, err=");
+    Serial.println(mqttClient.connectError());
+    while (1);
+  }
+  Serial.println("OK");
+
   delay(3000);
   rtcWakeFlag = false;  //  To avoid first false sample
   goToSleepFlag = true;
@@ -162,19 +168,22 @@ void setup()
 ///////////////////////////////////////////////////////////
 void loop()
 {
+  mqttClient.poll(); // keepalive
 
   if(rtcWakeFlag){  //  RTC Alarm (1min)
+  tsSendValue = rtc.getEpoch() - 1;  //  Minus 1sec for 1sec consistant delay
+  sampleTimeandDateFromRTC();
     rtcWakeFlag = false;
     #if ENABLE_DEBUG
       Serial.println("rtcWakeISR!");
     #endif
     // Sample Sensors
-    sampleTimeandDateFromRTC();
+    
     takeSamples(currentSampleNo);
     // Store/calculate sensor values (SD CARD?)
 //    storeSamples(currentSampleNo);
     //See if 10minute period has arrived?
-    int modTest = rtc.getMinutes()%10;
+    int modTest = rtc.getMinutes()%2;  //  Divide by 2 instead of 10 for testing
     if(modTest == 0){
       sendMsgFlag = true;
       #if ENABLE_DEBUG
@@ -207,7 +216,7 @@ void loop()
 
     //  This is where we do the sample averaging and message creation!
     calcSamples(currentSampleNo);
-    createJsonMsg();
+    createAndSendJsonMsg();
 
     //if this is midnight we need to set a flag to tell the next message loop to clear the 24hr counter!!!
   
@@ -237,7 +246,7 @@ void loop()
 
 //  Get sampling time from RTC
 void sampleTimeandDateFromRTC(){
-  sampleSecond = rtc.getSeconds();  
+  sampleSecond = 0;  
   sampleMinute = rtc.getMinutes();
   sampleHour = rtc.getHours();
   sampleYear = rtc.getYear();
@@ -278,9 +287,8 @@ void calcSamples(uint16_t no_of_samples){
   riverLevelAveSendValue = riverLevelTotal/no_of_samples;  //  Calculate the average river level during the sampling period
   riverLevelMaxSendValue = riverLevelMax;
   riverLevelMinSendValue = riverLevelMin;
-  rainIntervalSendValue = rainTipsCounter;
-  rain24hrSendValue = rain24hrTipsCounter;
-  tsSendValue = rtc.getEpoch();
+  rainIntervalSendValue = rainTipsCounter * rainGaugeCF;
+  rain24hrSendValue = rain24hrTipsCounter * rainGaugeCF;
   rainTipsCounter = 0;
   currentSampleNo = 0;
   riverLevelTotal = 0;
@@ -297,7 +305,7 @@ void storeSamples(uint16_t no_of_samples){
 }
 
 // Create Json message to send
-void createJsonMsg(){
+void createAndSendJsonMsg(){
   String payload;
   payload.reserve(2048);
 
@@ -305,8 +313,26 @@ void createJsonMsg(){
   payload += "{\"ts\":";
   payload += tsSendValue;   // uint32_t seconds
   payload += "000";       // ms
-  payload += ",\"values\":{";
-  payload = "{\"riverLevelAve\":";
+  payload += ",\"values\":";
+  payload += "{";
+  payload += "\"device\":\"";
+  payload += DEVICE_ID;
+  payload += "\",";
+/*  payload += "\"date\":\"";
+  payload += sampleDay;
+  payload += "-";
+  payload += sampleMonth;
+  payload += "-";
+  payload += sampleYear;
+  payload += "\",";
+    payload += "\"time\":\"";
+  payload += sampleHour;
+  payload += ":";
+  payload += sampleMinute;
+  payload += ":";
+  payload += sampleSecond;
+  payload += "\",";*/
+  payload += "\"riverLevelAve\":";
   payload += riverLevelAveSendValue;
   payload += ",\"riverLevelMax\":";
   payload += riverLevelMaxSendValue;
@@ -319,8 +345,12 @@ void createJsonMsg(){
   payload += "}}";
   payload += "]";
 
+  mqttClient.beginMessage(TB_TOPIC);
+  mqttClient.print(payload);
+  mqttClient.endMessage();
+
   #if ENABLE_DEBUG
-    Serial.println(payload);
+    Serial.print("Sent: "); Serial.println(payload);
   #endif
 }
 

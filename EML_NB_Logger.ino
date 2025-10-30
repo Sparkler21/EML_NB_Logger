@@ -150,14 +150,19 @@ void setup()
   // Auth: token as username, empty password
   mqttClient.setUsernamePassword(TB_TOKEN, "");
 
-  Serial.print("Connecting MQTT...");
+  #if ENABLE_DEBUG
+    Serial.print("Connecting MQTT...");
+  #endif
   if (!mqttClient.connect(TB_HOST, TB_PORT)) {
+  #if ENABLE_DEBUG
     Serial.print(" failed, err=");
     Serial.println(mqttClient.connectError());
+  #endif
     while (1);
   }
-  Serial.println("OK");
-
+  #if ENABLE_DEBUG
+    Serial.println("OK");
+  #endif
   delay(3000);
   rtcWakeFlag = false;  //  To avoid first false sample
   goToSleepFlag = true;
@@ -188,7 +193,7 @@ void loop()
       sendMsgFlag = true;
       #if ENABLE_DEBUG
         Serial.println("Modulus!");
-    #endif
+      #endif
     }
     //Increment currentSampleNo
     currentSampleNo++;  // Increment sample counter

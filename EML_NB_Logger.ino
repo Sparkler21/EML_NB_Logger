@@ -60,8 +60,9 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 #define PINNUMBER   ""          // SIM PIN if any
 
 #define SENSORS_MODE 0  // 0 = Rain and River Level, 1 = Rain only, 2 = River Level only
+#define RTC_ALARM_SECOND 58  //  The second the alarm is triggered
 #define SAMPLING_INTERVAL 10  // SAMPLING_INTERVAL in minutes
-uint16_t riverLevelRange = 5000;  //  Currently Max range in mm
+uint16_t riverLevelRange = 600;  //  Currently Max range in cm
 float rainGaugeCF = 0.200;  //  Rain gauge calibration factor
 
 // ---- ThingsBoard EU MQTT ----
@@ -104,17 +105,17 @@ volatile uint32_t lastPulseUs = 0;
 // minute samples
 uint8_t sampleNo = 0;
 uint16_t riverLevel = 0;
-uint16_t currentRiverLevel = 0;
-uint16_t riverLevelTotal = 0;
-uint16_t riverLevelMax = 0;
-uint16_t riverLevelMin = riverLevelRange;
+float currentRiverLevel = 0;
+float riverLevelTotal = 0;
+float riverLevelMax = 0;
+float riverLevelMin = riverLevelRange;
 uint8_t rainInterval = 0;
 uint16_t rain24hr = 0; 
 uint16_t currentSampleNo = 0;
 uint32_t tsSendValue = 0;
-uint16_t riverLevelAveSendValue = 0;
-uint16_t riverLevelMaxSendValue = 0;    //  This equals the minimum river level in mm.
-uint16_t riverLevelMinSendValue = riverLevelRange; //  This equals the maximum river level in mm.
+float riverLevelAveSendValue = 0;
+float riverLevelMaxSendValue = 0;    //  This equals the minimum river level in mm.
+float riverLevelMinSendValue = riverLevelRange; //  This equals the maximum river level in mm.
 float rainIntervalSendValue = 0;
 float rain24hrSendValue = 0;
 uint8_t sampleYear;
@@ -128,7 +129,7 @@ uint8_t sampleSecond;
 //  Helper Functions
 ///////////////////////////////////////////////////////////
 void resetAlarms(){
-    rtc.setAlarmSeconds(0);
+    rtc.setAlarmSeconds(RTC_ALARM_SECOND);
     rtc.enableAlarm(rtc.MATCH_SS);
 }
 ///////////////////////////////////////////////////////////
@@ -148,7 +149,7 @@ void setup()
 
 //  NEED AN RTC SAFETY NET HERE OR SOMEWHERE FOR FAILED NTP
 
-  rtc.setAlarmSeconds(0);
+  rtc.setAlarmSeconds(RTC_ALARM_SECOND);
   rtc.enableAlarm(rtc.MATCH_SS);
   rtc.attachInterrupt(rtcWakeISR);
 
@@ -213,11 +214,12 @@ void setup()
 ///////////////////////////////////////////////////////////
 void loop()
 {
+  
   mqttClient.poll(); // keepalive
 
   if(rtcWakeFlag){  //  RTC Alarm (1min)
-  tsSendValue = rtc.getEpoch() - 1;  //  Minus 1sec for 1sec consistant delay
   sampleTimeandDateFromRTC();
+  //sampleTimeandDateFromRTC();
     rtcWakeFlag = false;
     #if ENABLE_DEBUG
       Serial.println("rtcWakeISR!");
@@ -232,7 +234,7 @@ void loop()
     // Store/calculate sensor values (SD CARD?)
 //    storeSamples(currentSampleNo);
     //See if 10minute period has arrived?
-    int modTest = rtc.getMinutes()%SAMPLING_INTERVAL;  //  10min
+    int modTest = (rtc.getMinutes()+1)%SAMPLING_INTERVAL;  //  Need to add 1 as now sampling just before the minute change on 59secs
     if(modTest == 0){
       sendMsgFlag = true;
       #if ENABLE_DEBUG
@@ -261,6 +263,7 @@ void loop()
   }
 
   if(sendMsgFlag){  //  Send Message
+    tsSendValue = rtc.getEpoch();  //  Minus 1sec for 1sec consistant delay
     sendMsgFlag = false;  //clear flag
     #if ENABLE_DEBUG
       Serial.println("sendMessage!");
@@ -271,7 +274,7 @@ void loop()
     createAndSendJsonMsg(); 
 
     //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
-    if(sampleHour == 0 && sampleMinute == 0){
+    if(sampleHour == 23 && sampleMinute == 59){
       rain24hrTipsCounter = 0;
     }
   }
@@ -300,7 +303,7 @@ void loop()
 
 //  Get sampling time from RTC
 void sampleTimeandDateFromRTC(){
-  sampleSecond = 0;  
+  sampleSecond = rtc.getSeconds();  
   sampleMinute = rtc.getMinutes();
   sampleHour = rtc.getHours();
   sampleYear = rtc.getYear();
@@ -324,6 +327,7 @@ void takeRiverLevelSamples(uint16_t no_of_samples) {
   //SHUT DOWN SENSOR
 
   currentRiverLevel = adc/N;  //  Need multipliers and offsets?
+  currentRiverLevel = (currentRiverLevel/1024) * riverLevelRange;
   adc = 0;  // reset
   riverLevelTotal = riverLevelTotal + currentRiverLevel;  //  Totalise the river level samples
   if(riverLevelMax < currentRiverLevel){

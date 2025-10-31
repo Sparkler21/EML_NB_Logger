@@ -96,6 +96,7 @@ bool goToSleepFlag = false;
 
 // Pins
 const int PIN_RAIN = 7;  // contact-closure input (to GND)
+const int PIN_RL_EN = 6;  // River Level Enable
 
 // Globals
 volatile uint32_t rainTipsCounter = 0;
@@ -162,6 +163,9 @@ void setup()
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
+  pinMode(PIN_RL_EN, OUTPUT);
+  digitalWrite(PIN_RL_EN, HIGH);
+
   // After starting the modem with NB.begin()
   // attach the shield to the GPRS network with the APN, login and password
   while (!connected) {
@@ -216,7 +220,8 @@ void loop()
 {
   
   mqttClient.poll(); // keepalive
-
+//takeRiverLevelSamples(currentSampleNo);  //RL TEST
+//delay(1000);
   if(rtcWakeFlag){  //  RTC Alarm (1min)
   sampleTimeandDateFromRTC();
   //sampleTimeandDateFromRTC();

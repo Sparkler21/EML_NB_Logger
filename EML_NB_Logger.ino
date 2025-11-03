@@ -50,7 +50,7 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 /************************************************************
  * Enables debug support. To disable this feature set to 0.
  ***********************************************************/
-#define ENABLE_DEBUG                       1
+#define ENABLE_DEBUG                       0
 // ===================== User config =====================
 #define DEVICE_ID   "EML_HPT_001"
 // Your APN for LTE-M
@@ -58,7 +58,7 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 #define APN_USER    ""
 #define APN_PASS    ""
 #define PINNUMBER   ""          // SIM PIN if any
-
+#define VBAT_PIN A6
 #define SENSORS_MODE 0  // 0 = Rain and River Level, 1 = Rain only, 2 = River Level only
 #define RTC_ALARM_SECOND 58  //  The second the alarm is triggered
 #define SAMPLING_INTERVAL 10  // SAMPLING_INTERVAL in minutes
@@ -104,6 +104,7 @@ volatile uint32_t rain24hrTipsCounter = 0;
 volatile uint32_t lastPulseUs = 0;
 
 // minute samples
+float batteryVolts = 0;
 uint8_t sampleNo = 0;
 uint16_t riverLevel = 0;
 float currentRiverLevel = 0;
@@ -142,7 +143,7 @@ void setup()
     Serial.begin(115200);
     delay(1000);
   #endif
-
+  flashLED(1, 1000);
   // Start peripherals
   //Wire.begin();
   //ads.begin(); 
@@ -154,6 +155,8 @@ void setup()
   rtc.enableAlarm(rtc.MATCH_SS);
   rtc.attachInterrupt(rtcWakeISR);
 
+  analogReadResolution(12);
+
 // Rain input
     pinMode(PIN_RAIN, INPUT_PULLUP);
     LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
@@ -164,7 +167,7 @@ void setup()
   digitalWrite(LED_BUILTIN, LOW);
 
   pinMode(PIN_RL_EN, OUTPUT);
-  digitalWrite(PIN_RL_EN, HIGH);
+  digitalWrite(PIN_RL_EN, LOW);
 
   // After starting the modem with NB.begin()
   // attach the shield to the GPRS network with the APN, login and password
@@ -179,6 +182,7 @@ void setup()
       delay(1000);
     }
   }
+  flashLED(2, 2000);
   #if ENABLE_DEBUG
     Serial.println("\nStarting connection to server...");
   #endif
@@ -201,13 +205,14 @@ void setup()
   #if ENABLE_DEBUG
     Serial.print(" failed, err=");
     Serial.println(mqttClient.connectError());
+
   #endif
     while (1);
   }
   #if ENABLE_DEBUG
     Serial.println("OK");
   #endif
-  flashLED(5, 100);
+
   delay(3000);
   rtcWakeFlag = false;  //  To avoid first false sample
   goToSleepFlag = true;
@@ -218,7 +223,6 @@ void setup()
 ///////////////////////////////////////////////////////////
 void loop()
 {
-  
   mqttClient.poll(); // keepalive
 //takeRiverLevelSamples(currentSampleNo);  //RL TEST
 //delay(1000);
@@ -229,6 +233,8 @@ void loop()
     #if ENABLE_DEBUG
       Serial.println("rtcWakeISR!");
     #endif
+    //Read the LiPo battery volts level
+    readBatteryVoltage();
     // Sample Sensors
     if(SENSORS_MODE == 0 || SENSORS_MODE == 2){  //River Level
       takeRiverLevelSamples(currentSampleNo);
@@ -291,8 +297,8 @@ void loop()
         delay(100);
       #endif
       goToSleepFlag = false;  
-      LowPower.idle();
-    //LowPower.deepSleep();
+      //LowPower.idle();
+      LowPower.deepSleep();
     }
 
 
@@ -304,8 +310,6 @@ void loop()
 /****************************************************************/
 //                        FUNCTIONS                             //
 /****************************************************************/
-// Modem Connect Function
-
 //  Get sampling time from RTC
 void sampleTimeandDateFromRTC(){
   sampleSecond = rtc.getSeconds();  
@@ -317,22 +321,35 @@ void sampleTimeandDateFromRTC(){
 }
 
 // Sample Function
+
+void readBatteryVoltage() {
+  int raw = analogRead(VBAT_PIN);   // 0–4095 for 12-bit ADC
+  batteryVolts = (raw / 4095.0) * 3.3 * 2; // *2 because of onboard divider
+  #if ENABLE_DEBUG
+    Serial.print("Battery Volts = "); Serial.println(batteryVolts);
+  #endif
+}
+
 void takeRiverLevelSamples(uint16_t no_of_samples) {
   // Read River Level ADC(0)
   uint32_t adc = 0;
   const int N = 10;
   
   //POWER UP SENSOR
+  digitalWrite(PIN_RL_EN, HIGH);
   //SMALL DELAY of MORE THAN 20uS
+  delay(50); // small delay between samples  
+  
   for (int i = 0; i < N; i++) {
     //adc = ads.readADC_SingleEnded(0);
     adc = adc + analogRead(2);
     delay(50); // small delay between samples
   }
   //SHUT DOWN SENSOR
-
+  digitalWrite(PIN_RL_EN, LOW);
   currentRiverLevel = adc/N;  //  Need multipliers and offsets?
-  currentRiverLevel = (currentRiverLevel/1024) * riverLevelRange;
+  //currentRiverLevel = (currentRiverLevel/1024) * riverLevelRange;
+  currentRiverLevel = ((currentRiverLevel/4095.0) * 3300)/3.2;
   adc = 0;  // reset
   riverLevelTotal = riverLevelTotal + currentRiverLevel;  //  Totalise the river level samples
   if(riverLevelMax < currentRiverLevel){
@@ -409,11 +426,13 @@ void createAndSendJsonMsg(){
     payload += "\"device\":\"";
     payload += DEVICE_ID;
     payload += "\",";
-    payload += "\"riverLevelAve\":";
+    payload += "\"batV\":";
+    payload += batteryVolts;
+    payload += ",\"rlAve\":";
     payload += riverLevelAveSendValue;
-    payload += ",\"riverLevelMax\":";
+    payload += ",\"rlMax\":";
     payload += riverLevelMaxSendValue;
-    payload += ",\"riverLevelMin\":";
+    payload += ",\"rlMin\":";
     payload += riverLevelMinSendValue;
     payload += ",\"rainInt\":";
     payload += rainIntervalSendValue;
@@ -514,6 +533,7 @@ void getNTP()
       Serial.print(":");
       Serial.println(second());
     #endif
+    flashLED(5, 100);
     NTP_updatedFlag = true;  // Time has been set
   }
 

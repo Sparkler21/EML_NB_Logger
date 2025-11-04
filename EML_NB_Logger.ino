@@ -50,7 +50,7 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 /************************************************************
  * Enables debug support. To disable this feature set to 0.
  ***********************************************************/
-#define ENABLE_DEBUG                       0
+#define ENABLE_DEBUG                       1
 // ===================== User config =====================
 #define DEVICE_ID   "EML_HPT_001"
 // Your APN for LTE-M
@@ -143,6 +143,20 @@ void setup()
     Serial.begin(115200);
     delay(1000);
   #endif
+
+  // Rain input
+    pinMode(PIN_RAIN, INPUT_PULLUP);
+    LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
+    // connection state
+  boolean connected = false;
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  pinMode(PIN_RL_EN, OUTPUT);
+  digitalWrite(PIN_RL_EN, LOW);
+
+  delay(1000);
   flashLED(1, 1000);
   // Start peripherals
   //Wire.begin();
@@ -157,18 +171,6 @@ void setup()
 
   analogReadResolution(12);
 
-// Rain input
-    pinMode(PIN_RAIN, INPUT_PULLUP);
-    LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
-    // connection state
-  boolean connected = false;
-
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
-
-  pinMode(PIN_RL_EN, OUTPUT);
-  digitalWrite(PIN_RL_EN, LOW);
-
   // After starting the modem with NB.begin()
   // attach the shield to the GPRS network with the APN, login and password
   while (!connected) {
@@ -179,6 +181,7 @@ void setup()
       #if ENABLE_DEBUG
         Serial.println("Not connected");
       #endif
+      flashLED(2, 100);
       delay(1000);
     }
   }
@@ -298,6 +301,7 @@ void loop()
       #endif
       goToSleepFlag = false;  
       //LowPower.idle();
+      //rtc.standbyMode();
       LowPower.deepSleep();
     }
 

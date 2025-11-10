@@ -47,81 +47,16 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 #include <TimeLib.h>
 //#include <Adafruit_ADS1X15.h>
 #include <ArduinoMqttClient.h>
-
-#include <ArduinoBearSSL.h>  // (not used for TLS here, just keep includes harmless)
-#include <Client.h>
-
-//////////////////////
-//ERROR CHECKING
-//////////////////////
-enum class NetErr : int {
-  OK = 0,
-  SIM_NOT_READY,
-  BAD_APN,
-  NO_SIGNAL,
-  NOT_REGISTERED,    // CEREG not 1 or 5
-  PDP_FAIL,
-  DNS_FAIL,
-  UDP_OPEN_FAIL,
-  UDP_SEND_FAIL,
-  UDP_RECV_TIMEOUT,
-  NTP_BAD_REPLY,
-  MODEM_TIMEOUT,
-  UNKNOWN
-};
-
-const char* netErrStr(NetErr e) {
-  switch (e) {
-    case NetErr::OK: return "OK";
-    case NetErr::SIM_NOT_READY: return "SIM not ready";
-    case NetErr::BAD_APN: return "APN/auth fail";
-    case NetErr::NO_SIGNAL: return "No/low signal";
-    case NetErr::NOT_REGISTERED: return "Not registered (CEREG)";
-    case NetErr::PDP_FAIL: return "PDP activation failed";
-    case NetErr::DNS_FAIL: return "DNS resolution failed";
-    case NetErr::UDP_OPEN_FAIL: return "UDP open failed";
-    case NetErr::UDP_SEND_FAIL: return "UDP send failed";
-    case NetErr::UDP_RECV_TIMEOUT: return "UDP recv timeout";
-    case NetErr::NTP_BAD_REPLY: return "NTP bad reply";
-    case NetErr::MODEM_TIMEOUT: return "Modem timeout";
-    default: return "Unknown";
-  }
-}
-
-struct AttachResult {
-  NetErr err;
-  int csq;      // 0..31, 99 unknown
-  int cereg;    // 0=not, 1=home, 5=roaming, 2=searching, 3=denied, 4=unknown
-};
-
-
-
-// --- forward declarations (add after your AttachResult struct) ---
-void rtcWakeISR();
-void rainWakeISR();
-
-void getNTP();
-void sendNTPpacket(IPAddress& address);
-void showError(NetErr e);
-
-// Ensure the compiler knows the signature and the AttachResult type here:
-AttachResult nbAttach(const char* apn, const char* user, const char* pass, uint32_t deadlineMs);
-NetErr syncTimeViaNTP(uint32_t totalDeadlineMs = 15000);
-
 /************************************************************
  * Enables debug support. To disable this feature set to 0.
  ***********************************************************/
-#define ENABLE_DEBUG                        1
-#define ENABLE_MAX_MIN_RL                   0
+#define ENABLE_DEBUG                       0
 // ===================== User config =====================
 #define DEVICE_ID   "EML_HPT_001"
 // Your APN for LTE-M
-//#define APN         "gigsky-02"
-const char* APN = "gigsky-02";
-const char* APN_USER = "";
-const char* APN_PASS = "";
-//#define APN_USER    ""
-//#define APN_PASS    ""
+#define APN         "gigsky-02"
+#define APN_USER    ""
+#define APN_PASS    ""
 #define PINNUMBER   ""          // SIM PIN if any
 #define VBAT_PIN A6
 #define SENSORS_MODE 0  // 0 = Rain and River Level, 1 = Rain only, 2 = River Level only
@@ -129,13 +64,6 @@ const char* APN_PASS = "";
 #define SAMPLING_INTERVAL 10  // SAMPLING_INTERVAL in minutes
 uint16_t riverLevelRange = 600;  //  Currently Max range in cm
 float rainGaugeCF = 0.200;  //  Rain gauge calibration factor
-
-//  Deadline Constants in ms
-const uint32_t ATTACH_DEADLINE_MS = 15000;
-const uint32_t UDP_OPEN_DEADLINE_MS = 3000;
-const uint32_t UDP_SEND_DEADLINE_MS = 4000;
-const uint32_t UDP_RECV_TIMEOUT_MS  = 5000;
-const uint32_t NTP_TOTAL_DEADLINE_MS = 10000;
 
 // ---- ThingsBoard EU MQTT ----
 const char TB_HOST[]   = "mqtt.eu.thingsboard.cloud"; // EU cluster
@@ -152,12 +80,12 @@ unsigned int localPort = 2390;      // local port to listen for UDP packets
 /* Initialise Library instances */
 RTCZero rtc;
 GPRS gprs;
-NB nbAccess;        // controls modem and network registration
-NBUDP udp;          // UDP socket
-NBScanner scanner;  // for signal strength
+NB nbAccess;
 NBClient nbClient;
-
 MqttClient mqttClient(nbClient);
+// A UDP instance to let us send and receive packets over UDP
+NBUDP Udp;
+//Adafruit_ADS1115 ads;
 
 // Flags
 bool NTP_updatedFlag = false;
@@ -174,20 +102,6 @@ const int PIN_RL_EN = 6;  // River Level Enable
 volatile uint32_t rainTipsCounter = 0;
 volatile uint32_t rain24hrTipsCounter = 0;
 volatile uint32_t lastPulseUs = 0;
-
-// ---------- Time Sync Backoff Globals ----------
-bool useServerTimestamp = true;      // fallback: ThingsBoard timestamps until NTP succeeds
-uint32_t nextTimeSyncMs = 0;         // when next time sync attempt is allowed (millis-based)
-uint32_t timeSyncBackoffMs = 5UL * 60UL * 1000UL;  // start with 5-minute interval
-
-
-const char* NTP_HOSTS[] = {
-  "time.google.com",
-  "pool.ntp.org",
-  "time.cloudflare.com"
-};
-const IPAddress NTP_IP_FALLBACK(129, 6, 15, 28); // time.nist.gov
-
 
 // minute samples
 float batteryVolts = 0;
@@ -220,307 +134,6 @@ void resetAlarms(){
     rtc.setAlarmSeconds(RTC_ALARM_SECOND);
     rtc.enableAlarm(rtc.MATCH_SS);
 }
-
-//////////////////////
-//ERROR CHECKING - Back off helper
-//////////////////////
-uint32_t backoffMs(uint8_t attempt, uint32_t baseMs=1000, uint32_t capMs=30000) {
-  uint32_t ms = baseMs << min<uint8_t>(attempt, 10); // cap growth
-  if (ms > capMs) ms = capMs;
-  // jitter ±20%
-  uint32_t jitter = ms / 5;
-  return ms - jitter + (rand() % (2*jitter + 1));
-}
-
-// ---- LED error blinker ----
-void showError(NetErr e) {
-  uint8_t blinks = 9; // default “unknown”
-  switch (e) {
-    case NetErr::SIM_NOT_READY:   blinks = 2; break;
-    case NetErr::BAD_APN:         blinks = 3; break;
-    case NetErr::NOT_REGISTERED:  blinks = 4; break;
-    case NetErr::DNS_FAIL:        blinks = 5; break;
-    case NetErr::UDP_OPEN_FAIL:   blinks = 6; break;
-    case NetErr::UDP_RECV_TIMEOUT:
-    case NetErr::NTP_BAD_REPLY:   blinks = 7; break;
-    case NetErr::MODEM_TIMEOUT:   blinks = 8; break;
-    default:                      blinks = 9; break;
-  }
-
-  for (uint8_t i = 0; i < blinks; ++i) {
-    digitalWrite(LED_BUILTIN, HIGH); delay(200);
-    digitalWrite(LED_BUILTIN, LOW);  delay(200);
-  }
-}
-
-
-bool openUDPWithRetry(uint16_t port, uint32_t totalMs = 4000) {
-  unsigned long t0 = millis();
-  int attempt = 0;
-  while (millis() - t0 < totalMs) {
-    if (udp.begin(port)) return true;
-    udp.stop();
-    delay(200 + attempt * 100);
-    attempt++;
-  }
-  // Ephemeral fallback
-  if (udp.begin(0)) return true;
-  udp.stop();
-  return false;
-}
-
-bool waitForPDPReady(uint32_t deadlineMs = 8000) {
-  unsigned long t0 = millis();
-  while (millis() - t0 < deadlineMs) {
-    IPAddress ip = gprs.getIPAddress();           // MKRNB API
-    if (ip[0] != 0 || ip[1] != 0 || ip[2] != 0 || ip[3] != 0) {
-      Serial.print("PDP IP: "); Serial.println(ip);
-      delay(750);                                  // small settle
-      return true;
-    }
-    delay(250);
-  }
-  return false;
-}
-
-bool isPDPUp() {
-  IPAddress ip = gprs.getIPAddress();
-  return (ip[0] | ip[1] | ip[2] | ip[3]) != 0;
-}
-
-// ---- Open UDP with patient retries & backoff (ephemeral port preferred) ----
-bool openUDP_Patient(uint32_t totalMs = 12000) {
-  // try ephemeral first (fewer conflicts on MKRNB)
-  unsigned long start = millis();
-  uint32_t attempt = 0;
-  while (millis() - start < totalMs) {
-    if (udp.begin(0)) return true;     // ephemeral local port
-    udp.stop();
-    uint32_t wait = 150 + (attempt * 150);
-    if (wait > 800) wait = 800;
-    delay(wait);
-    attempt++;
-  }
-  return false;
-}
-
-// Quick TCP probe (DNS-free): return true if we can TCP connect to an open server.
-// We use example.com:80 because it’s stable and listens on 80.
-bool tcpProbe_IP(IPAddress ip, uint16_t port, uint32_t timeoutMs = 5000) {
-  NBClient c;
-  unsigned long t0 = millis();
-  if (!c.connect(ip, port)) return false;   // immediate outcome is enough
-  // Optional tiny wait to ensure it really opened
-  while (!c.connected() && millis() - t0 < timeoutMs) delay(10);
-  bool ok = c.connected();
-  c.stop();
-  return ok;
-}
-
-// Full modem + PDP refresh (socket layer sometimes needs this)
-bool recoverModemAndPDP(uint32_t deadlineMs = 20000) {
-  Serial.println("[RECOVER] Modem shutdown...");
-  nbAccess.shutdown();
-  delay(1500);
-
-  Serial.println("[RECOVER] NB.begin(PINONLY)...");
-  int st = nbAccess.begin(PINNUMBER);
-  Serial.print("[RECOVER] NB.begin returned: "); Serial.println(st);
-  if (st != NB_READY) Serial.println("[RECOVER] NB.begin not NB_READY — continuing anyway...");
-
-  // ---- non-blocking attachGPRS ----
-  Serial.println("[RECOVER] attachGPRS() (non-blocking loop)");
-  bool attached = false;
-  unsigned long start = millis();
-  while (millis() - start < deadlineMs) {
-    // Try attach, but don't block forever
-    if (gprs.attachGPRS()) {
-      attached = true;
-      break;
-    }
-    delay(500);
-  }
-  Serial.print("[RECOVER] attachGPRS() returned: ");
-  Serial.println(attached ? "true" : "false");
-
-  Serial.println("[RECOVER] Waiting for IP...");
-  unsigned long waitStart = millis();
-  while (millis() - waitStart < deadlineMs) {
-    IPAddress ip = gprs.getIPAddress();
-    Serial.print("[RECOVER] getIPAddress(): "); Serial.println(ip);
-    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
-      Serial.print("[RECOVER] PDP IP acquired: "); Serial.println(ip);
-      delay(750);
-      return true;
-    }
-    delay(500);
-  }
-  Serial.println("[RECOVER] Timed out waiting for PDP IP");
-  return false;
-}
-
-
-
-// MQTT connect with retries and recovery between attempts
-bool connectMQTT_withRecovery(const char* host, int port, uint8_t maxAttempts = 3) {
-  mqttClient.setId(DEVICE_ID);
-  mqttClient.setUsernamePassword(TB_TOKEN, "");
-
-  IPAddress probeIP(93,184,216,34); // example.com
-  for (uint8_t attempt = 1; attempt <= maxAttempts; ++attempt) {
-    Serial.print("[MQTT] Attempt "); Serial.print(attempt);
-    Serial.println(" - probing TCP 93.184.216.34:80");
-    bool tcpOK = tcpProbe_IP(probeIP, 80);
-    Serial.print("[MQTT] TCP probe: "); Serial.println(tcpOK ? "OK" : "FAIL");
-
-    if (!tcpOK) {
-      Serial.println("[MQTT] TCP dead; trying modem/PDP recovery...");
-      Serial.println("[MQTT] Invoking recoverModemAndPDP() (TCP probe failed)");
-      bool ok = recoverModemAndPDP();
-      Serial.print("[MQTT] recoverModemAndPDP() returned: ");
-      Serial.println(ok ? "true" : "false");
-
-      if (!ok) Serial.println("[MQTT] Recovery failed.");
-      else     Serial.println("[MQTT] Recovery succeeded.");
-      delay(800);
-    }
-
-    Serial.print("[MQTT] Connecting MQTT ("); Serial.print(host); Serial.print(":"); Serial.print(port); Serial.println(")...");
-    if (mqttClient.connect(host, port)) {
-      Serial.println("[MQTT] OK");
-      return true;
-    } else {
-      int e = mqttClient.connectError();
-      Serial.print("[MQTT] failed, err="); Serial.println(e);
-      switch (e) {
-        case -1: Serial.println("[MQTT] Timeout waiting for CONNACK"); break;
-        case -2: Serial.println("[MQTT] TCP connect failed (PDP/DNS/fw)"); break;
-        case -3: Serial.println("[MQTT] Protocol/broker rejected"); break;
-        case -4: Serial.println("[MQTT] Auth/token rejected"); break;
-        default: Serial.println("[MQTT] Unknown error"); break;
-      }
-      // Between attempts, do one more recovery; then backoff
-      Serial.println("[MQTT] Invoking recoverModemAndPDP() (post MQTT fail)");
-      (bool)recoverModemAndPDP();
-      Serial.println("[MQTT] recoverModemAndPDP() returned (post MQTT fail)");
-      delay(1000 * attempt);
-    }
-  }
-  return false;
-}
-
-void refreshModemSocketLayer() {
-  Serial.println("[SOCKET] Refreshing modem socket service...");
-  nbAccess.shutdown();
-  delay(1500);
-  int st = nbAccess.begin(PINNUMBER);
-  Serial.print("[SOCKET] NB.begin returned: "); Serial.println(st);
-  if (st != NB_READY) Serial.println("[SOCKET] NB not ready, continuing anyway");
-  (void)gprs.attachGPRS();
-  unsigned long t0 = millis();
-  while (millis() - t0 < 8000) {
-    IPAddress ip = gprs.getIPAddress();
-    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
-      Serial.print("[SOCKET] Refreshed PDP IP: "); Serial.println(ip);
-      break;
-    }
-    delay(250);
-  }
-}
-
-bool publishTelemetryReliable() {
-  // Ensure MQTT is connected before we try
-  if (!mqttClient.connected()) {
-    Serial.println("[PUB] MQTT not connected, attempting recovery...");
-    if (!connectMQTT_withRecovery(TB_HOST, TB_PORT, 2)) {
-      Serial.println("[PUB] MQTT recovery failed.");
-      return false;
-    }
-  }
-
-  // Build payload (server ts vs device ts)
-  String payload;
-  payload.reserve(512);  // enough for your fields
-
-  if (!useServerTimestamp) {
-    // device-timestamped format: [{ "ts": <millis>, "values": {...}}]
-    payload += "[{\"ts\":";
-    payload += (rtc.getEpoch()); payload += "000";
-    payload += ",\"values\":{";
-    payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
-    payload += "\"batV\":"; payload += batteryVolts; payload += ",";
-    payload += "\"rlAve\":"; payload += riverLevelAveSendValue; payload += ",";
-    payload += "\"rlMax\":"; payload += riverLevelMaxSendValue; payload += ",";
-    payload += "\"rlMin\":"; payload += riverLevelMinSendValue; payload += ",";
-    payload += "\"rainInt\":"; payload += rainIntervalSendValue; payload += ",";
-    payload += "\"rain24hr\":"; payload += rain24hrSendValue;
-    payload += "}}]";
-  } else {
-    // server-timestamped: plain object (no ts/values wrapper)
-    payload += "{";
-    payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
-    payload += "\"batV\":"; payload += batteryVolts; payload += ",";
-    payload += "\"rlAve\":"; payload += riverLevelAveSendValue; payload += ",";
-    payload += "\"rlMax\":"; payload += riverLevelMaxSendValue; payload += ",";
-    payload += "\"rlMin\":"; payload += riverLevelMinSendValue; payload += ",";
-    payload += "\"rainInt\":"; payload += rainIntervalSendValue; payload += ",";
-    payload += "\"rain24hr\":"; payload += rain24hrSendValue;
-    payload += "}";
-  }
-
-  // Start message
-  if (!mqttClient.beginMessage(TB_TOPIC)) {
-    Serial.println("[PUB] beginMessage() failed");
-    return false;
-  }
-  mqttClient.print(payload);
-  bool ok = mqttClient.endMessage();   // ArduinoMqttClient returns bool
-  Serial.print("[PUB] endMessage() -> "); Serial.println(ok ? "OK" : "FAIL");
-
-  // Keep the link alive long enough to flush the TCP buffer
-  unsigned long t0 = millis();
-  while (millis() - t0 < 800) {        // ~0.8s flush window
-    mqttClient.poll();                 // pumps keepalive / socket
-    delay(20);
-  }
-
-  // If broker dropped us mid-send, try once more
-  if (!ok || !mqttClient.connected()) {
-    Serial.println("[PUB] publish not confirmed or disconnected; retrying once...");
-    if (!connectMQTT_withRecovery(TB_HOST, TB_PORT, 1)) return false;
-
-    if (!mqttClient.beginMessage(TB_TOPIC)) return false;
-    mqttClient.print(payload);
-    ok = mqttClient.endMessage();
-    Serial.print("[PUB] retry endMessage() -> "); Serial.println(ok ? "OK" : "FAIL");
-
-    t0 = millis();
-    while (millis() - t0 < 800) { mqttClient.poll(); delay(20); }
-  }
-
-  if (ok) {
-    Serial.print("Sent: "); Serial.println(payload);
-  }
-  return ok;
-}
-
-void scheduleNextTimeSync(bool success) {
-  if (success) {
-    // After a successful sync, wait longer before next check
-    timeSyncBackoffMs = 30UL * 60UL * 1000UL; // 30 minutes, adjust as you like
-  } else {
-    // Exponential backoff up to 6 hours
-    if (timeSyncBackoffMs < 6UL * 60UL * 60UL * 1000UL)
-      timeSyncBackoffMs *= 2;
-  }
-  // Add ±20% jitter so devices don't all sync simultaneously
-  uint32_t j = timeSyncBackoffMs / 5;
-  nextTimeSyncMs = millis() + (timeSyncBackoffMs - j + (rand() % (2 * j + 1)));
-  Serial.print("[TIME] Next sync scheduled in ");
-  Serial.print(timeSyncBackoffMs / 60000);
-  Serial.println(" minutes");
-}
-
 ///////////////////////////////////////////////////////////
 //  SETUP
 ///////////////////////////////////////////////////////////
@@ -528,10 +141,23 @@ void setup()
 {
   #if ENABLE_DEBUG
     Serial.begin(115200);
-    delay(3000);
-    Serial.println("EML NB Logger");
+    delay(1000);
   #endif
-  // Rain input
+  flashLED(1, 1000);
+  // Start peripherals
+  //Wire.begin();
+  //ads.begin(); 
+  rtc.begin(); // initialize RTC 24H format
+
+//  NEED AN RTC SAFETY NET HERE OR SOMEWHERE FOR FAILED NTP
+
+  rtc.setAlarmSeconds(RTC_ALARM_SECOND);
+  rtc.enableAlarm(rtc.MATCH_SS);
+  rtc.attachInterrupt(rtcWakeISR);
+
+  analogReadResolution(12);
+
+// Rain input
     pinMode(PIN_RAIN, INPUT_PULLUP);
     LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
     // connection state
@@ -542,74 +168,50 @@ void setup()
 
   pinMode(PIN_RL_EN, OUTPUT);
   digitalWrite(PIN_RL_EN, LOW);
- 
-  rtc.begin(); // initialize RTC 24H format
-  rtc.setAlarmSeconds(RTC_ALARM_SECOND);
-  rtc.enableAlarm(rtc.MATCH_SS);
-  rtc.attachInterrupt(rtcWakeISR);
 
-  analogReadResolution(12);
-
-// Modem/NB-IoT attach with observability
-AttachResult ar = nbAttach(APN, APN_USER, APN_PASS, ATTACH_DEADLINE_MS);
-if (ar.err != NetErr::OK) {
-  Serial.print("Attach failed: "); Serial.println(netErrStr(ar.err));
-  showError(ar.err);
-  while (1) { delay(1000); } // stop; or implement a timed retry loop
-}
-
-Serial.print("Attached. CSQ="); Serial.print(ar.csq);
-Serial.print(" CEREG="); Serial.println(ar.cereg);
-
-Serial.println("Starting connection to server...");
-IPAddress ip = gprs.getIPAddress();
-Serial.print("PDP IP pre-NTP: "); Serial.println(ip);
-
-// === TIME SYNC (mandatory preferred, but don't brick the boot) ===
-useServerTimestamp = false;
-scheduleNextTimeSync(false); // plan first sync attempt soon after boot
-
-// --- ensure PDP is actually up before NTP ---
-ip = gprs.getIPAddress();
-if ((ip[0] | ip[1] | ip[2] | ip[3]) == 0) {
-  Serial.println("[SETUP] PDP IP is 0.0.0.0 — re-attaching before NTP...");
-  gprs.detachGPRS();
-  delay(500);
-  unsigned long t0 = millis();
-  bool attached = false;
-  while (millis() - t0 < 10000) {
-    if (gprs.attachGPRS()) { attached = true; break; }
-    delay(500);
+  // After starting the modem with NB.begin()
+  // attach the shield to the GPRS network with the APN, login and password
+  while (!connected) {
+    if ((nbAccess.begin(PINNUMBER, APN) == NB_READY) &&
+        (gprs.attachGPRS() == GPRS_READY)) {
+      connected = true;
+    } else {
+      #if ENABLE_DEBUG
+        Serial.println("Not connected");
+      #endif
+      delay(1000);
+    }
   }
-  ip = gprs.getIPAddress();
-  Serial.print("[SETUP] Re-attached PDP IP: "); Serial.println(ip);
-  if ((ip[0] | ip[1] | ip[2] | ip[3]) == 0) {
-    Serial.println("[SETUP] Still no IP — continuing anyway, fallback will handle it.");
+  flashLED(2, 2000);
+  #if ENABLE_DEBUG
+    Serial.println("\nStarting connection to server...");
+  #endif
+  Udp.begin(localPort);
+
+  getNTP();
+  if(NTP_updatedFlag == false){
+    delay(10000);  //Wait 10seconds then try again...
+    getNTP();
   }
-}
 
-NetErr ntpErr = syncTimeViaNTP(15000);
-if (ntpErr != NetErr::OK) {
-  Serial.println("UDP NTP failed, falling back to HTTP-Date (IP)...");
-  ntpErr = syncTimeViaHTTPDate_IP();
-}
+  mqttClient.setId(DEVICE_ID);
+  // Auth: token as username, empty password
+  mqttClient.setUsernamePassword(TB_TOKEN, "");
 
-if (ntpErr != NetErr::OK) {
-  Serial.print("Time sync failed: "); Serial.println(netErrStr(ntpErr));
-  Serial.println("Proceeding with ThingsBoard server timestamps.");
-  useServerTimestamp = true;
-} else {
-  Serial.println("Time sync OK");
-}
+  #if ENABLE_DEBUG
+    Serial.print("Connecting MQTT...");
+  #endif
+  if (!mqttClient.connect(TB_HOST, TB_PORT)) {
+  #if ENABLE_DEBUG
+    Serial.print(" failed, err=");
+    Serial.println(mqttClient.connectError());
 
-// === MQTT with recovery ===
-if (!connectMQTT_withRecovery(TB_HOST, TB_PORT, 3)) {
-  Serial.println("[BOOT] MQTT connect ultimately failed; will operate offline and retry later.");
-  // Don’t halt: you can keep sampling, and retry MQTT on your send interval.
-}
-
-
-
+  #endif
+    while (1);
+  }
+  #if ENABLE_DEBUG
+    Serial.println("OK");
+  #endif
 
   delay(3000);
   rtcWakeFlag = false;  //  To avoid first false sample
@@ -678,31 +280,6 @@ void loop()
       Serial.println("sendMessage!");
     #endif  
 
-    // Before sending (when sendMsgFlag becomes true):
-    if (!mqttClient.connected()) {
-      (void)connectMQTT_withRecovery(TB_HOST, TB_PORT, 2);  // lightweight retry
-    }
-
-    if (useServerTimestamp) {
-      // Before time sync, ensure socket layer healthy
-      IPAddress ip = gprs.getIPAddress();
-      if ((ip[0] | ip[1] | ip[2] | ip[3]) == 0) {
-        Serial.println("[LOOP] PDP IP missing, forcing socket refresh...");
-        refreshModemSocketLayer();
-      } else {
-        Serial.print("[LOOP] PDP IP still good: "); Serial.println(ip);
-      }
-
-      NetErr e = syncTimeViaNTP(8000);
-      if (e != NetErr::OK) e = syncTimeViaHTTPDate_IP();
-      if (e == NetErr::OK) {
-        Serial.println("Recovered time sync; switching to device timestamps.");
-        useServerTimestamp = false;
-      }
-    }
-
-
-
     //  This is where we do the sample averaging and message creation!
     calcSamples(currentSampleNo);
     createAndSendJsonMsg(); 
@@ -710,17 +287,6 @@ void loop()
     //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
     if(sampleHour == 23 && sampleMinute == 59){
       rain24hrTipsCounter = 0;
-
-      if (useServerTimestamp) {  //  If Time has not sync'd.  Try every 24hrs.
-        NetErr e = syncTimeViaNTP(8000);
-        if (e != NetErr::OK) {
-          e = syncTimeViaHTTPDate_IP();
-        }
-        if (e == NetErr::OK) {
-          Serial.println("Recovered time sync; switching to device timestamps.");
-          useServerTimestamp = false;
-        }
-      }
     }
   }
 
@@ -731,9 +297,8 @@ void loop()
         delay(100);
       #endif
       goToSleepFlag = false;  
-      LowPower.idle();
-      //rtc.standbyMode();
-      //LowPower.deepSleep();
+      //LowPower.idle();
+      LowPower.deepSleep();
     }
 
 
@@ -787,14 +352,12 @@ void takeRiverLevelSamples(uint16_t no_of_samples) {
   currentRiverLevel = ((currentRiverLevel/4095.0) * 3300)/3.2;
   adc = 0;  // reset
   riverLevelTotal = riverLevelTotal + currentRiverLevel;  //  Totalise the river level samples
-  #if ENABLE_MAX_MIN_RL
-    if(riverLevelMax < currentRiverLevel){
-      riverLevelMax = currentRiverLevel;  //  New Max in the samples
-    }
-    if(riverLevelMin > currentRiverLevel){
-      riverLevelMin = currentRiverLevel;  //  New Min in the samples
-    }
-  #endif
+  if(riverLevelMax < currentRiverLevel){
+    riverLevelMax = currentRiverLevel;  //  New Max in the samples
+  }
+  if(riverLevelMin > currentRiverLevel){
+    riverLevelMin = currentRiverLevel;  //  New Min in the samples
+  }
 
   #if ENABLE_DEBUG
     Serial.print(sampleYear+2000); Serial.print("-"); Serial.print(sampleMonth); Serial.print("-"); Serial.print(sampleDay);
@@ -802,12 +365,9 @@ void takeRiverLevelSamples(uint16_t no_of_samples) {
     Serial.print(sampleHour); Serial.print(":"); Serial.print(sampleMinute); Serial.print(":"); Serial.print(sampleSecond); Serial.print(", ");
     Serial.print("Sample No = "); Serial.print(no_of_samples); Serial.print(", ");
     Serial.print("RiverLevel-Current = "); Serial.print(currentRiverLevel); Serial.print(", ");
-    Serial.print("RiverLevel-Total = "); Serial.print(riverLevelTotal); 
-    #if ENABLE_MAX_MIN_RL
-      Serial.print(", ");
-      Serial.print("RiverLevel-Max = "); Serial.print(riverLevelMax); Serial.print(", ");
-      Serial.print("RiverLevel-Min = "); Serial.println(riverLevelMin);
-    #endif
+    Serial.print("RiverLevel-Total = "); Serial.print(riverLevelTotal); Serial.print(", ");
+    Serial.print("RiverLevel-Max = "); Serial.print(riverLevelMax); Serial.print(", ");
+    Serial.print("RiverLevel-Min = "); Serial.println(riverLevelMin);
   #endif
 }
 
@@ -825,16 +385,14 @@ void takeRainSamples(uint16_t no_of_samples) {
 
 // Process Sensors Function (inc Rain Reset if day change?)
 void calcSamples(uint16_t no_of_samples){
-Serial.println("calcSamples");
+
   if(SENSORS_MODE == 0 || SENSORS_MODE == 2){  //River Level
     riverLevelAveSendValue = riverLevelTotal/no_of_samples;  //  Calculate the average river level during the sampling period
-    #if ENABLE_MAX_MIN_RL
-      riverLevelMaxSendValue = riverLevelMax;
-      riverLevelMinSendValue = riverLevelMin;
-      riverLevelMax = 0;
-      riverLevelMin = riverLevelRange;
-    #endif
+    riverLevelMaxSendValue = riverLevelMax;
+    riverLevelMinSendValue = riverLevelMin;
     riverLevelTotal = 0;
+    riverLevelMax = 0;
+    riverLevelMin = riverLevelRange;
   }
 
   if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
@@ -855,28 +413,79 @@ void storeSamples(uint16_t no_of_samples){
 
 // Create Json message to send
 void createAndSendJsonMsg(){
-  // Try time sync opportunistically (optional—use your backoff logic if added)
-  if ((int32_t)(millis() - nextTimeSyncMs) >= 0) {
-    Serial.println("[TIME] Attempting sync...");
-    NetErr e = syncTimeViaNTP(12000);
-    if (e != NetErr::OK) e = syncTimeViaHTTPDate_IP();
-    if (e == NetErr::OK) { useServerTimestamp = false; scheduleNextTimeSync(true); }
-    else { useServerTimestamp = true; scheduleNextTimeSync(false); }
+  String payload;
+  payload.reserve(2048);
+
+  if(SENSORS_MODE == 0){  //Rain and River Level
+    payload += "[";
+    payload += "{\"ts\":";
+    payload += tsSendValue;   // uint32_t seconds
+    payload += "000";       // ms
+    payload += ",\"values\":";
+    payload += "{";
+    payload += "\"device\":\"";
+    payload += DEVICE_ID;
+    payload += "\",";
+    payload += "\"batV\":";
+    payload += batteryVolts;
+    payload += ",\"rlAve\":";
+    payload += riverLevelAveSendValue;
+    payload += ",\"rlMax\":";
+    payload += riverLevelMaxSendValue;
+    payload += ",\"rlMin\":";
+    payload += riverLevelMinSendValue;
+    payload += ",\"rainInt\":";
+    payload += rainIntervalSendValue;
+    payload += ",\"rain24hr\":";
+    payload += rain24hrSendValue;
+    payload += "}}";
+    payload += "]";
   }
-
-  // Publish
-  bool pubOK = publishTelemetryReliable();
-
-  // Stay awake a touch after publish so bytes drain
-  if (pubOK) {
-    unsigned long t0 = millis();
-    while (millis() - t0 < 600) { mqttClient.poll(); delay(20); }
-  } else {
-    Serial.println("[PUB] Telemetry publish failed.");
+  if(SENSORS_MODE == 1){  //Rain only
+    payload += "[";
+    payload += "{\"ts\":";
+    payload += tsSendValue;   // uint32_t seconds
+    payload += "000";       // ms
+    payload += ",\"values\":";
+    payload += "{";
+    payload += "\"device\":\"";
+    payload += DEVICE_ID;
+    payload += "\",";
+    payload += "\"rainInt\":";
+    payload += rainIntervalSendValue;
+    payload += ",\"rain24hr\":";
+    payload += rain24hrSendValue;
+    payload += "}}";
+    payload += "]";
   }
+  if(SENSORS_MODE == 2){  //River Level only
+    payload += "[";
+    payload += "{\"ts\":";
+    payload += tsSendValue;   // uint32_t seconds
+    payload += "000";       // ms
+    payload += ",\"values\":";
+    payload += "{";
+    payload += "\"device\":\"";
+    payload += DEVICE_ID;
+    payload += "\",";
+    payload += "\"riverLevelAve\":";
+    payload += riverLevelAveSendValue;
+    payload += ",\"riverLevelMax\":";
+    payload += riverLevelMaxSendValue;
+    payload += ",\"riverLevelMin\":";
+    payload += riverLevelMinSendValue;
+    payload += "}}";
+    payload += "]";
+  }
+  mqttClient.beginMessage(TB_TOPIC);
+  mqttClient.print(payload);
+  mqttClient.endMessage();
 
+  #if ENABLE_DEBUG
+    Serial.print("Sent: "); Serial.println(payload);
+    flashLED(1, 2000);
+  #endif
 }
-
 
 
 ///////////////////////////////////////////////////////////
@@ -887,12 +496,12 @@ void getNTP()
   sendNTPpacket(timeServer); // send an NTP packet to a time server
   // wait to see if a reply is available
   delay(1000);
-  if ( udp.parsePacket() ) {
+  if ( Udp.parsePacket() ) {
     #if ENABLE_DEBUG
       Serial.println("NTP packet received");
     #endif
     // We've received a packet, read the data from it
-    udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
+    Udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
     //the timestamp starts at byte 40 of the received packet and is four bytes,
     // or two words, long. First, extract the two words:
     unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
@@ -924,128 +533,15 @@ void getNTP()
       Serial.print(":");
       Serial.println(second());
     #endif
+    flashLED(5, 100);
     NTP_updatedFlag = true;  // Time has been set
   }
 
-}
-bool openUDPForNTP(uint16_t preferredPort = 2390, uint32_t totalMs = 6000) {
-  // try the preferred port for ~3s
-  unsigned long t0 = millis();
-  while (millis() - t0 < 3000) {
-    if (udp.begin(preferredPort)) return true;
-    udp.stop();
-    delay(250);
-  }
-  // fallback to ephemeral port for ~3s
-  t0 = millis();
-  while (millis() - t0 < 3000) {
-    if (udp.begin(0)) return true;
-    udp.stop();
-    delay(250);
-  }
-  return false;
+  // wait ten seconds before asking for the time again
+//  delay(10000);
 }
 
-
-NetErr syncTimeViaNTP(uint32_t deadlineMs) {
-  Serial.println("[NTP] Starting time sync");
-
-  NBUDP ntpUdp;  // ← local, fresh UDP socket instance every time
-
-  auto openUDP_PatientLocal = [&](uint32_t totalMs) -> bool {
-    unsigned long start = millis();
-    uint32_t attempt = 0;
-    while (millis() - start < totalMs) {
-      if (ntpUdp.begin(0)) return true;      // ephemeral local port
-      ntpUdp.stop();
-      uint32_t wait = 150 + attempt * 150;
-      if (wait > 800) wait = 800;
-      delay(wait);
-      attempt++;
-    }
-    return false;
-  };
-
-  // Try to open UDP patiently
-  if (!openUDP_PatientLocal(12000)) {
-    Serial.println("[NTP] UDP open failed, retrying after PDP re-attach...");
-    gprs.detachGPRS(); delay(600);
-    (void)gprs.attachGPRS();
-    // wait for IP again
-    unsigned long t0 = millis();
-    while (millis() - t0 < 6000) {
-      IPAddress ip = gprs.getIPAddress();
-      if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) break;
-      delay(250);
-    }
-    if (!openUDP_PatientLocal(8000)) {
-      Serial.println("[NTP] UDP still failed to open after re-attach.");
-      ntpUdp.stop();
-      return NetErr::UDP_OPEN_FAIL;
-    }
-  }
-
-  // Build the NTP request
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  packetBuffer[0] = 0b11100011;
-  packetBuffer[2] = 6;
-  packetBuffer[3] = 0xEC;
-  packetBuffer[12] = 49; packetBuffer[13] = 0x4E;
-  packetBuffer[14] = 49; packetBuffer[15] = 52;
-
-  // Use stable NTP IPs (no DNS)
-  const IPAddress servers[] = {
-    IPAddress(129, 6, 15, 28),   // time.nist.gov
-    IPAddress(162, 159, 200, 1), // time.cloudflare.com anycast
-    IPAddress(216, 239, 35, 0)   // time.google.com anycast
-  };
-
-  auto tryOne = [&](const IPAddress& ip) -> NetErr {
-    if (!ntpUdp.beginPacket(ip, 123)) return NetErr::UDP_SEND_FAIL;
-    ntpUdp.write(packetBuffer, NTP_PACKET_SIZE);
-    if (!ntpUdp.endPacket()) return NetErr::UDP_SEND_FAIL;
-
-    unsigned long t0 = millis();
-    while (millis() - t0 < 2500) {
-      int sz = ntpUdp.parsePacket();
-      if (sz >= NTP_PACKET_SIZE) {
-        ntpUdp.read(packetBuffer, NTP_PACKET_SIZE);
-        uint32_t secs1900 = ((uint32_t)packetBuffer[40] << 24) |
-                            ((uint32_t)packetBuffer[41] << 16) |
-                            ((uint32_t)packetBuffer[42] << 8)  |
-                             (uint32_t)packetBuffer[43];
-        const uint32_t seventyYears = 2208988800UL;
-        if (secs1900 > seventyYears) {
-          uint32_t epoch = secs1900 - seventyYears;
-          setTime(epoch);
-          rtc.setTime(hour(), minute(), second());
-          rtc.setDate(day(), month(), (year() - 2000));
-          NTP_updatedFlag = true;
-          return NetErr::OK;
-        }
-        return NetErr::NTP_BAD_REPLY;
-      }
-      delay(50);
-    }
-    return NetErr::UDP_RECV_TIMEOUT;
-  };
-
-  // Try each server within overall deadline
-  unsigned long startOverall = millis();
-  for (const auto& ip : servers) {
-    if (millis() - startOverall > deadlineMs) break;
-    NetErr e = tryOne(ip);
-    if (e == NetErr::OK) { ntpUdp.stop(); return NetErr::OK; }
-  }
-
-  ntpUdp.stop();
-  return NetErr::MODEM_TIMEOUT;
-}
-
-
-
-
-void sendNTPpacket(IPAddress& address)
+unsigned long sendNTPpacket(IPAddress& address)
 {
   //Serial.println("1");
   // set all bytes in the buffer to 0
@@ -1067,172 +563,13 @@ void sendNTPpacket(IPAddress& address)
 
   // all NTP fields have been given values, now
   // you can send a packet requesting a timestamp:
-  udp.beginPacket(address, 123); //NTP requests are to port 123
+  Udp.beginPacket(address, 123); //NTP requests are to port 123
   //Serial.println("4");
-  udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
   //Serial.println("5");
-  udp.endPacket();
+  Udp.endPacket();
   //Serial.println("6");
 }
-
-
-// HTTP Date fallback over plain TCP, DNS-free (connect by IP)
-NetErr syncTimeViaHTTPDate_IP() {
-  NBClient http;  // plain TCP (no TLS)
-  IPAddress hostIP(93, 184, 216, 34);  // example.com (static, DNS-free)
-  const char* hostName = "example.com"; // for Host: header
-
-  Serial.println("[HTTP-Date] Connecting to example.com (IP)");
-  if (!http.connect(hostIP, 80)) {
-    Serial.println("[HTTP-Date] TCP connect failed");
-    return NetErr::MODEM_TIMEOUT;   // or NetErr::UDP_OPEN_FAIL if you prefer
-  }
-
-  // Minimal HTTP GET just to fetch the Date header
-  http.print(
-    "GET / HTTP/1.1\r\n"
-    "Host: example.com\r\n"
-    "Connection: close\r\n\r\n"
-  );
-
-  unsigned long t0 = millis();
-  while (!http.available() && (millis() - t0 < 5000)) delay(50);
-
-  String line, dateLine;
-  while (http.connected()) {
-    int c = http.read();
-    if (c < 0) { delay(5); continue; }
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (line.length() == 0) break;  // end of headers
-      if (line.startsWith("Date:")) dateLine = line;
-      line = "";
-    } else {
-      line += (char)c;
-    }
-  }
-  http.stop();
-
-  if (dateLine.length() == 0) return NetErr::NTP_BAD_REPLY;
-
-  // Example: "Date: Wed, 06 Nov 2025 14:22:12 GMT"
-  int comma = dateLine.indexOf(',');
-  int firstSpace = dateLine.indexOf(' ', comma + 1);
-  if (comma < 0 || firstSpace < 0) return NetErr::NTP_BAD_REPLY;
-
-  String rest = dateLine.substring(firstSpace + 1); // "06 Nov 2025 14:22:12 GMT"
-  rest.trim();
-  int sp1 = rest.indexOf(' ');
-  int sp2 = rest.indexOf(' ', sp1 + 1);
-  int sp3 = rest.indexOf(' ', sp2 + 1);
-  if (sp1 < 0 || sp2 < 0 || sp3 < 0) return NetErr::NTP_BAD_REPLY;
-
-  String dd   = rest.substring(0, sp1);
-  String mon  = rest.substring(sp1 + 1, sp2);
-  String yyyy = rest.substring(sp2 + 1, sp3);
-  String hms  = rest.substring(sp3 + 1); // "14:22:12 GMT"
-
-  int spGMT = hms.indexOf(' ');
-  if (spGMT > 0) hms = hms.substring(0, spGMT);
-
-  int colon1 = hms.indexOf(':');
-  int colon2 = hms.indexOf(':', colon1 + 1);
-  if (colon1 < 0 || colon2 < 0) return NetErr::NTP_BAD_REPLY;
-
-  int d  = dd.toInt();
-  int yy = yyyy.toInt();
-  int hh = hms.substring(0, colon1).toInt();
-  int mm = hms.substring(colon1 + 1, colon2).toInt();
-  int ss = hms.substring(colon2 + 1).toInt();
-
-  // Month lookup
-  int monthNum = 0;
-  if      (mon == "Jan") monthNum = 1;
-  else if (mon == "Feb") monthNum = 2;
-  else if (mon == "Mar") monthNum = 3;
-  else if (mon == "Apr") monthNum = 4;
-  else if (mon == "May") monthNum = 5;
-  else if (mon == "Jun") monthNum = 6;
-  else if (mon == "Jul") monthNum = 7;
-  else if (mon == "Aug") monthNum = 8;
-  else if (mon == "Sep") monthNum = 9;
-  else if (mon == "Oct") monthNum = 10;
-  else if (mon == "Nov") monthNum = 11;
-  else if (mon == "Dec") monthNum = 12;
-  else return NetErr::NTP_BAD_REPLY;
-
-  tmElements_t tme;
-  tme.Second = ss;
-  tme.Minute = mm;
-  tme.Hour   = hh;
-  tme.Day    = d;
-  tme.Month  = monthNum;
-  tme.Year   = yy - 1970;   // TimeLib expects years since 1970
-
-  time_t epoch = makeTime(tme);
-  if (epoch < 1609459200UL) return NetErr::NTP_BAD_REPLY; // sanity check (>= 2021)
-
-  setTime(epoch);
-  rtc.setTime(hour(), minute(), second());
-  rtc.setDate(day(), month(), (year() - 2000));
-  NTP_updatedFlag = true;
-
-  Serial.print("[HTTP-Date] Time set from header: ");
-  Serial.println(dateLine);
-
-  return NetErr::OK;
-}
-
-
-
-// Modem/NB-IoT attach with observability
-AttachResult nbAttach(const char* apn, const char* user, const char* pass,
-                      uint32_t deadlineMs) {
-  AttachResult r{NetErr::UNKNOWN, 99, 0};
-  Serial.println("[nbAttach] entry");
-
-  // 1) Bring up the modem & register (PIN ONLY on this core)
-  Serial.println("[nbAttach] NB.begin(PINONLY) now");
-  int st = nbAccess.begin(PINNUMBER);   // <<< KEY CHANGE: no APN args
-  Serial.print("[nbAttach] NB.begin status="); Serial.println(st);
-  if (st != NB_READY) {
-    Serial.println("[nbAttach] NB.begin not ready -> NOT_REGISTERED/BAD_APN");
-    r.err = NetErr::NOT_REGISTERED;   // or BAD_APN; library doesn’t distinguish
-    return r;
-  }
-  r.cereg = 1;
-
-  // 2) Nudge PDP, then poll for a real IP (no args on this core)
-  Serial.println("[nbAttach] attachGPRS() nudge (no args)");
-  (void)gprs.attachGPRS();   // harmless if already up
-
-  Serial.println("[nbAttach] waiting for PDP IP...");
-  unsigned long t0 = millis();
-  IPAddress ip(0,0,0,0);
-  while (millis() - t0 < deadlineMs) {
-    ip = gprs.getIPAddress();
-    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) break;
-    delay(250);
-  }
-  if ((ip[0] | ip[1] | ip[2] | ip[3]) == 0) {
-    Serial.println("[nbAttach] PDP failed (no IP)");
-    r.err = NetErr::PDP_FAIL;
-    return r;
-  }
-  Serial.print("[nbAttach] PDP IP: "); Serial.println(ip);
-
-  delay(750);               // small settle for sockets/DNS
-  r.csq = 99;               // best-effort
-  r.err = NetErr::OK;
-  Serial.println("[nbAttach] done");
-  return r;
-}
-
-
-
-
-
-
 
 void flashLED(uint8_t no_of_flashes, uint16_t delay_time)
 {

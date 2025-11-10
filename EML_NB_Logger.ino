@@ -50,7 +50,7 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 /************************************************************
  * Enables debug support. To disable this feature set to 0.
  ***********************************************************/
-#define ENABLE_DEBUG                       0
+#define ENABLE_DEBUG                       1
 // ===================== User config =====================
 #define DEVICE_ID   "EML_HPT_001"
 // Your APN for LTE-M
@@ -134,90 +134,150 @@ void resetAlarms(){
     rtc.setAlarmSeconds(RTC_ALARM_SECOND);
     rtc.enableAlarm(rtc.MATCH_SS);
 }
+
+// Bring modem up, register, attach PDP, and wait for an IP.
+// Uses PIN-only begin (most reliable on MKR NB 1500 variants).
+bool nbAttachSimple(uint32_t regDeadlineMs = 25000, uint32_t pdpDeadlineMs = 30000) {
+  Serial.println("[NET] NB.begin(PINONLY)...");
+  int st = nbAccess.begin(PINNUMBER);          // don’t loop this; some cores misbehave
+  Serial.print("[NET] NB.begin -> "); Serial.println(st);
+
+  // Proceed even if not NB_READY; some stacks still allow PDP
+  unsigned long t0 = millis();
+  bool haveIP = false;
+  bool kicked = false;
+
+  Serial.println("[NET] Starting PDP bring-up (timed loop)...");
+  while (millis() - t0 < pdpDeadlineMs) {
+    // “Nudge” PDP attach occasionally; keep it non-blocking
+    if (!kicked || ((millis() - t0) % 5000UL) < 100UL) {
+      (void)gprs.attachGPRS();                 // returns quickly on most cores
+      kicked = true;
+    }
+
+    IPAddress ip = gprs.getIPAddress();        // non-blocking poll
+    Serial.print("[NET] IP poll: "); Serial.println(ip);
+    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) { // got an IP
+      haveIP = true;
+      break;
+    }
+    delay(500);
+  }
+
+  if (haveIP) {
+    // small settle for sockets
+    delay(750);
+    Serial.print("[NET] PDP IP: "); Serial.println(gprs.getIPAddress());
+    return true;
+  }
+
+  // One modem refresh attempt
+  Serial.println("[NET] PDP timed out, refreshing modem once...");
+  nbAccess.shutdown();
+  delay(1500);
+
+  Serial.println("[NET] NB.begin(PINONLY) after refresh...");
+  st = nbAccess.begin(PINNUMBER);
+  Serial.print("[NET] NB.begin -> "); Serial.println(st);
+
+  // Try PDP again with a shorter window
+  t0 = millis();
+  while (millis() - t0 < 15000) {
+    (void)gprs.attachGPRS();
+    IPAddress ip = gprs.getIPAddress();
+    Serial.print("[NET] IP poll (retry): "); Serial.println(ip);
+    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
+      delay(750);
+      Serial.print("[NET] PDP IP (retry): "); Serial.println(ip);
+      return true;
+    }
+    delay(500);
+  }
+
+  Serial.println("[NET] PDP attach failed after refresh.");
+  return false;
+}
+
+
+// Map ArduinoMqttClient connectError() for clarity
+void printMqttErr(int e) {
+  Serial.print("[MQTT] connectError="); Serial.println(e);
+  switch (e) {
+    case -1: Serial.println("[MQTT] Timeout waiting for CONNACK"); break;
+    case -2: Serial.println("[MQTT] TCP connect failed (PDP/DNS/firewall)"); break;
+    case -3: Serial.println("[MQTT] Protocol/broker rejected"); break;
+    case -4: Serial.println("[MQTT] Auth/token rejected"); break;
+    default: Serial.println("[MQTT] Unknown error"); break;
+  }
+}
+
 ///////////////////////////////////////////////////////////
 //  SETUP
 ///////////////////////////////////////////////////////////
-void setup()
-{
-  #if ENABLE_DEBUG
-    Serial.begin(115200);
-    delay(1000);
-  #endif
-  flashLED(1, 1000);
-  // Start peripherals
-  //Wire.begin();
-  //ads.begin(); 
-  rtc.begin(); // initialize RTC 24H format
-
-//  NEED AN RTC SAFETY NET HERE OR SOMEWHERE FOR FAILED NTP
-
-  rtc.setAlarmSeconds(RTC_ALARM_SECOND);
-  rtc.enableAlarm(rtc.MATCH_SS);
-  rtc.attachInterrupt(rtcWakeISR);
-
-  analogReadResolution(12);
-
-// Rain input
-    pinMode(PIN_RAIN, INPUT_PULLUP);
-    LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
-    // connection state
-  boolean connected = false;
-
+void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
+  Serial.begin(115200);
+  unsigned long t0 = millis(); while (!Serial && millis()-t0 < 4000) {}
+  Serial.println("\n\n=== BOOT ===");
 
-  pinMode(PIN_RL_EN, OUTPUT);
-  digitalWrite(PIN_RL_EN, LOW);
-
-  // After starting the modem with NB.begin()
-  // attach the shield to the GPRS network with the APN, login and password
-  while (!connected) {
-    if ((nbAccess.begin(PINNUMBER, APN) == NB_READY) &&
-        (gprs.attachGPRS() == GPRS_READY)) {
-      connected = true;
-    } else {
-      #if ENABLE_DEBUG
-        Serial.println("Not connected");
-      #endif
-      delay(1000);
-    }
-  }
-  flashLED(2, 2000);
-  #if ENABLE_DEBUG
-    Serial.println("\nStarting connection to server...");
-  #endif
-  Udp.begin(localPort);
-
-  getNTP();
-  if(NTP_updatedFlag == false){
-    delay(10000);  //Wait 10seconds then try again...
-    getNTP();
+  // 1) Attach
+  if (!nbAttachSimple(25000)) {
+    Serial.println("[BOOT] PDP attach failed. Will not proceed.");
+    return;
   }
 
-  mqttClient.setId(DEVICE_ID);
-  // Auth: token as username, empty password
+
+
+  // 3) MQTT connect (token as username, empty password)
+  mqttClient.setId("MKRNB_TEST");
   mqttClient.setUsernamePassword(TB_TOKEN, "");
 
-  #if ENABLE_DEBUG
-    Serial.print("Connecting MQTT...");
-  #endif
+  Serial.print("[MQTT] Connecting to "); Serial.print(TB_HOST); Serial.print(":"); Serial.println(TB_PORT);
   if (!mqttClient.connect(TB_HOST, TB_PORT)) {
-  #if ENABLE_DEBUG
-    Serial.print(" failed, err=");
-    Serial.println(mqttClient.connectError());
+    int e = mqttClient.connectError();
+    printMqttErr(e);
 
-  #endif
-    while (1);
+    // If this prints "TCP connect failed" and tcpProbeExample() also failed,
+    // the data plane is down -> reattach once, then stop.
+    if (e == -2) {
+      Serial.println("[MQTT] Trying one re-attach and retry...");
+      gprs.detachGPRS(); delay(600);
+      if (nbAttachSimple(20000)) {
+        Serial.print("[MQTT] Retrying connect... ");
+        if (!mqttClient.connect(TB_HOST, TB_PORT)) {
+          printMqttErr(mqttClient.connectError());
+          Serial.println("[MQTT] Still failing; stop here for now.");
+          return;
+        }
+      } else {
+        Serial.println("[MQTT] Re-attach failed; stop here.");
+        return;
+      }
+    } else {
+      Serial.println("[MQTT] Non-TCP error; stop here.");
+      return;
+    }
   }
-  #if ENABLE_DEBUG
-    Serial.println("OK");
-  #endif
+  Serial.println("[MQTT] Connected.");
 
-  delay(3000);
-  rtcWakeFlag = false;  //  To avoid first false sample
-  goToSleepFlag = true;
+  // 4) Send a single tiny test message and keep link alive briefly
+  Serial.println("[PUB] Sending test payload...");
+  mqttClient.beginMessage("v1/devices/me/telemetry");
+  mqttClient.print("{\"hello\":1}");
+  bool ok = mqttClient.endMessage();
+  Serial.print("[PUB] endMessage() -> "); Serial.println(ok ? "OK" : "FAIL");
+
+  unsigned long t1 = millis();
+  while (millis() - t1 < 1000) { mqttClient.poll(); delay(20); }
+
+  Serial.println("[DONE] Minimal connect+publish path finished.");
 }
 
+void loop() {
+  // empty while testing connection
+}
+
+/*
 ///////////////////////////////////////////////////////////
 //  START OF LOOP
 ///////////////////////////////////////////////////////////
@@ -297,8 +357,8 @@ void loop()
         delay(100);
       #endif
       goToSleepFlag = false;  
-      //LowPower.idle();
-      LowPower.deepSleep();
+      LowPower.idle();
+      //LowPower.deepSleep();
     }
 
 
@@ -306,7 +366,7 @@ void loop()
 ///////////////////////////////////////////////////////////
 //  END OF LOOP
 ///////////////////////////////////////////////////////////
-
+*/
 /****************************************************************/
 //                        FUNCTIONS                             //
 /****************************************************************/

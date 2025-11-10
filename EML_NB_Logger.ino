@@ -175,6 +175,12 @@ volatile uint32_t rainTipsCounter = 0;
 volatile uint32_t rain24hrTipsCounter = 0;
 volatile uint32_t lastPulseUs = 0;
 
+// ---------- Time Sync Backoff Globals ----------
+bool useServerTimestamp = true;      // fallback: ThingsBoard timestamps until NTP succeeds
+uint32_t nextTimeSyncMs = 0;         // when next time sync attempt is allowed (millis-based)
+uint32_t timeSyncBackoffMs = 5UL * 60UL * 1000UL;  // start with 5-minute interval
+
+
 const char* NTP_HOSTS[] = {
   "time.google.com",
   "pool.ntp.org",
@@ -298,6 +304,222 @@ bool openUDP_Patient(uint32_t totalMs = 12000) {
   return false;
 }
 
+// Quick TCP probe (DNS-free): return true if we can TCP connect to an open server.
+// We use example.com:80 because it’s stable and listens on 80.
+bool tcpProbe_IP(IPAddress ip, uint16_t port, uint32_t timeoutMs = 5000) {
+  NBClient c;
+  unsigned long t0 = millis();
+  if (!c.connect(ip, port)) return false;   // immediate outcome is enough
+  // Optional tiny wait to ensure it really opened
+  while (!c.connected() && millis() - t0 < timeoutMs) delay(10);
+  bool ok = c.connected();
+  c.stop();
+  return ok;
+}
+
+// Full modem + PDP refresh (socket layer sometimes needs this)
+bool recoverModemAndPDP(uint32_t deadlineMs = 20000) {
+  Serial.println("[RECOVER] Modem shutdown...");
+  nbAccess.shutdown();
+  delay(1500);
+
+  Serial.println("[RECOVER] NB.begin(PINONLY)...");
+  int st = nbAccess.begin(PINNUMBER);
+  Serial.print("[RECOVER] NB.begin returned: "); Serial.println(st);
+  if (st != NB_READY) Serial.println("[RECOVER] NB.begin not NB_READY — continuing anyway...");
+
+  // ---- non-blocking attachGPRS ----
+  Serial.println("[RECOVER] attachGPRS() (non-blocking loop)");
+  bool attached = false;
+  unsigned long start = millis();
+  while (millis() - start < deadlineMs) {
+    // Try attach, but don't block forever
+    if (gprs.attachGPRS()) {
+      attached = true;
+      break;
+    }
+    delay(500);
+  }
+  Serial.print("[RECOVER] attachGPRS() returned: ");
+  Serial.println(attached ? "true" : "false");
+
+  Serial.println("[RECOVER] Waiting for IP...");
+  unsigned long waitStart = millis();
+  while (millis() - waitStart < deadlineMs) {
+    IPAddress ip = gprs.getIPAddress();
+    Serial.print("[RECOVER] getIPAddress(): "); Serial.println(ip);
+    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
+      Serial.print("[RECOVER] PDP IP acquired: "); Serial.println(ip);
+      delay(750);
+      return true;
+    }
+    delay(500);
+  }
+  Serial.println("[RECOVER] Timed out waiting for PDP IP");
+  return false;
+}
+
+
+
+// MQTT connect with retries and recovery between attempts
+bool connectMQTT_withRecovery(const char* host, int port, uint8_t maxAttempts = 3) {
+  mqttClient.setId(DEVICE_ID);
+  mqttClient.setUsernamePassword(TB_TOKEN, "");
+
+  IPAddress probeIP(93,184,216,34); // example.com
+  for (uint8_t attempt = 1; attempt <= maxAttempts; ++attempt) {
+    Serial.print("[MQTT] Attempt "); Serial.print(attempt);
+    Serial.println(" - probing TCP 93.184.216.34:80");
+    bool tcpOK = tcpProbe_IP(probeIP, 80);
+    Serial.print("[MQTT] TCP probe: "); Serial.println(tcpOK ? "OK" : "FAIL");
+
+    if (!tcpOK) {
+      Serial.println("[MQTT] TCP dead; trying modem/PDP recovery...");
+      Serial.println("[MQTT] Invoking recoverModemAndPDP() (TCP probe failed)");
+      bool ok = recoverModemAndPDP();
+      Serial.print("[MQTT] recoverModemAndPDP() returned: ");
+      Serial.println(ok ? "true" : "false");
+
+      if (!ok) Serial.println("[MQTT] Recovery failed.");
+      else     Serial.println("[MQTT] Recovery succeeded.");
+      delay(800);
+    }
+
+    Serial.print("[MQTT] Connecting MQTT ("); Serial.print(host); Serial.print(":"); Serial.print(port); Serial.println(")...");
+    if (mqttClient.connect(host, port)) {
+      Serial.println("[MQTT] OK");
+      return true;
+    } else {
+      int e = mqttClient.connectError();
+      Serial.print("[MQTT] failed, err="); Serial.println(e);
+      switch (e) {
+        case -1: Serial.println("[MQTT] Timeout waiting for CONNACK"); break;
+        case -2: Serial.println("[MQTT] TCP connect failed (PDP/DNS/fw)"); break;
+        case -3: Serial.println("[MQTT] Protocol/broker rejected"); break;
+        case -4: Serial.println("[MQTT] Auth/token rejected"); break;
+        default: Serial.println("[MQTT] Unknown error"); break;
+      }
+      // Between attempts, do one more recovery; then backoff
+      Serial.println("[MQTT] Invoking recoverModemAndPDP() (post MQTT fail)");
+      (bool)recoverModemAndPDP();
+      Serial.println("[MQTT] recoverModemAndPDP() returned (post MQTT fail)");
+      delay(1000 * attempt);
+    }
+  }
+  return false;
+}
+
+void refreshModemSocketLayer() {
+  Serial.println("[SOCKET] Refreshing modem socket service...");
+  nbAccess.shutdown();
+  delay(1500);
+  int st = nbAccess.begin(PINNUMBER);
+  Serial.print("[SOCKET] NB.begin returned: "); Serial.println(st);
+  if (st != NB_READY) Serial.println("[SOCKET] NB not ready, continuing anyway");
+  (void)gprs.attachGPRS();
+  unsigned long t0 = millis();
+  while (millis() - t0 < 8000) {
+    IPAddress ip = gprs.getIPAddress();
+    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
+      Serial.print("[SOCKET] Refreshed PDP IP: "); Serial.println(ip);
+      break;
+    }
+    delay(250);
+  }
+}
+
+bool publishTelemetryReliable() {
+  // Ensure MQTT is connected before we try
+  if (!mqttClient.connected()) {
+    Serial.println("[PUB] MQTT not connected, attempting recovery...");
+    if (!connectMQTT_withRecovery(TB_HOST, TB_PORT, 2)) {
+      Serial.println("[PUB] MQTT recovery failed.");
+      return false;
+    }
+  }
+
+  // Build payload (server ts vs device ts)
+  String payload;
+  payload.reserve(512);  // enough for your fields
+
+  if (!useServerTimestamp) {
+    // device-timestamped format: [{ "ts": <millis>, "values": {...}}]
+    payload += "[{\"ts\":";
+    payload += (rtc.getEpoch()); payload += "000";
+    payload += ",\"values\":{";
+    payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+    payload += "\"batV\":"; payload += batteryVolts; payload += ",";
+    payload += "\"rlAve\":"; payload += riverLevelAveSendValue; payload += ",";
+    payload += "\"rlMax\":"; payload += riverLevelMaxSendValue; payload += ",";
+    payload += "\"rlMin\":"; payload += riverLevelMinSendValue; payload += ",";
+    payload += "\"rainInt\":"; payload += rainIntervalSendValue; payload += ",";
+    payload += "\"rain24hr\":"; payload += rain24hrSendValue;
+    payload += "}}]";
+  } else {
+    // server-timestamped: plain object (no ts/values wrapper)
+    payload += "{";
+    payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+    payload += "\"batV\":"; payload += batteryVolts; payload += ",";
+    payload += "\"rlAve\":"; payload += riverLevelAveSendValue; payload += ",";
+    payload += "\"rlMax\":"; payload += riverLevelMaxSendValue; payload += ",";
+    payload += "\"rlMin\":"; payload += riverLevelMinSendValue; payload += ",";
+    payload += "\"rainInt\":"; payload += rainIntervalSendValue; payload += ",";
+    payload += "\"rain24hr\":"; payload += rain24hrSendValue;
+    payload += "}";
+  }
+
+  // Start message
+  if (!mqttClient.beginMessage(TB_TOPIC)) {
+    Serial.println("[PUB] beginMessage() failed");
+    return false;
+  }
+  mqttClient.print(payload);
+  bool ok = mqttClient.endMessage();   // ArduinoMqttClient returns bool
+  Serial.print("[PUB] endMessage() -> "); Serial.println(ok ? "OK" : "FAIL");
+
+  // Keep the link alive long enough to flush the TCP buffer
+  unsigned long t0 = millis();
+  while (millis() - t0 < 800) {        // ~0.8s flush window
+    mqttClient.poll();                 // pumps keepalive / socket
+    delay(20);
+  }
+
+  // If broker dropped us mid-send, try once more
+  if (!ok || !mqttClient.connected()) {
+    Serial.println("[PUB] publish not confirmed or disconnected; retrying once...");
+    if (!connectMQTT_withRecovery(TB_HOST, TB_PORT, 1)) return false;
+
+    if (!mqttClient.beginMessage(TB_TOPIC)) return false;
+    mqttClient.print(payload);
+    ok = mqttClient.endMessage();
+    Serial.print("[PUB] retry endMessage() -> "); Serial.println(ok ? "OK" : "FAIL");
+
+    t0 = millis();
+    while (millis() - t0 < 800) { mqttClient.poll(); delay(20); }
+  }
+
+  if (ok) {
+    Serial.print("Sent: "); Serial.println(payload);
+  }
+  return ok;
+}
+
+void scheduleNextTimeSync(bool success) {
+  if (success) {
+    // After a successful sync, wait longer before next check
+    timeSyncBackoffMs = 30UL * 60UL * 1000UL; // 30 minutes, adjust as you like
+  } else {
+    // Exponential backoff up to 6 hours
+    if (timeSyncBackoffMs < 6UL * 60UL * 60UL * 1000UL)
+      timeSyncBackoffMs *= 2;
+  }
+  // Add ±20% jitter so devices don't all sync simultaneously
+  uint32_t j = timeSyncBackoffMs / 5;
+  nextTimeSyncMs = millis() + (timeSyncBackoffMs - j + (rand() % (2 * j + 1)));
+  Serial.print("[TIME] Next sync scheduled in ");
+  Serial.print(timeSyncBackoffMs / 60000);
+  Serial.println(" minutes");
+}
 
 ///////////////////////////////////////////////////////////
 //  SETUP
@@ -339,38 +561,53 @@ if (ar.err != NetErr::OK) {
 Serial.print("Attached. CSQ="); Serial.print(ar.csq);
 Serial.print(" CEREG="); Serial.println(ar.cereg);
 
-Serial.println("\nStarting connection to server...");
-
+Serial.println("Starting connection to server...");
 IPAddress ip = gprs.getIPAddress();
 Serial.print("PDP IP pre-NTP: "); Serial.println(ip);
 
+// === TIME SYNC (mandatory preferred, but don't brick the boot) ===
+useServerTimestamp = false;
+scheduleNextTimeSync(false); // plan first sync attempt soon after boot
+
+// --- ensure PDP is actually up before NTP ---
+ip = gprs.getIPAddress();
+if ((ip[0] | ip[1] | ip[2] | ip[3]) == 0) {
+  Serial.println("[SETUP] PDP IP is 0.0.0.0 — re-attaching before NTP...");
+  gprs.detachGPRS();
+  delay(500);
+  unsigned long t0 = millis();
+  bool attached = false;
+  while (millis() - t0 < 10000) {
+    if (gprs.attachGPRS()) { attached = true; break; }
+    delay(500);
+  }
+  ip = gprs.getIPAddress();
+  Serial.print("[SETUP] Re-attached PDP IP: "); Serial.println(ip);
+  if ((ip[0] | ip[1] | ip[2] | ip[3]) == 0) {
+    Serial.println("[SETUP] Still no IP — continuing anyway, fallback will handle it.");
+  }
+}
+
 NetErr ntpErr = syncTimeViaNTP(15000);
 if (ntpErr != NetErr::OK) {
-  Serial.print("NTP failed: "); Serial.println(netErrStr(ntpErr));
-  showError(ntpErr);
-  while (1) { delay(1000); } // or implement your backoff/retry loop
+  Serial.println("UDP NTP failed, falling back to HTTP-Date (IP)...");
+  ntpErr = syncTimeViaHTTPDate_IP();
 }
-Serial.println("NTP sync OK");
 
-// then do your mqttClient.connect(TB_HOST, TB_PORT) block…
-mqttClient.setId(DEVICE_ID);
-mqttClient.setUsernamePassword(TB_TOKEN, "");
-
-Serial.print("Connecting MQTT ("); Serial.print(TB_HOST); Serial.print(":"); Serial.print(TB_PORT); Serial.println(")...");
-if (!mqttClient.connect(TB_HOST, TB_PORT)) {
-  int e = mqttClient.connectError();
-  Serial.print(" failed, err="); Serial.println(e);
-  switch (e) {
-    case -1: Serial.println("MQTT: Timeout waiting for CONNACK"); break;
-    case -2: Serial.println("MQTT: TCP connect failed (PDP/DNS/fw)"); break;
-    case -3: Serial.println("MQTT: Protocol/broker rejected"); break;
-    case -4: Serial.println("MQTT: Auth/token rejected"); break;
-    default: Serial.println("MQTT: Unknown error"); break;
-  }
-  showError(NetErr::DNS_FAIL);
-  while (1) { delay(1000); }
+if (ntpErr != NetErr::OK) {
+  Serial.print("Time sync failed: "); Serial.println(netErrStr(ntpErr));
+  Serial.println("Proceeding with ThingsBoard server timestamps.");
+  useServerTimestamp = true;
+} else {
+  Serial.println("Time sync OK");
 }
-Serial.println("OK");
+
+// === MQTT with recovery ===
+if (!connectMQTT_withRecovery(TB_HOST, TB_PORT, 3)) {
+  Serial.println("[BOOT] MQTT connect ultimately failed; will operate offline and retry later.");
+  // Don’t halt: you can keep sampling, and retry MQTT on your send interval.
+}
+
 
 
 
@@ -441,6 +678,31 @@ void loop()
       Serial.println("sendMessage!");
     #endif  
 
+    // Before sending (when sendMsgFlag becomes true):
+    if (!mqttClient.connected()) {
+      (void)connectMQTT_withRecovery(TB_HOST, TB_PORT, 2);  // lightweight retry
+    }
+
+    if (useServerTimestamp) {
+      // Before time sync, ensure socket layer healthy
+      IPAddress ip = gprs.getIPAddress();
+      if ((ip[0] | ip[1] | ip[2] | ip[3]) == 0) {
+        Serial.println("[LOOP] PDP IP missing, forcing socket refresh...");
+        refreshModemSocketLayer();
+      } else {
+        Serial.print("[LOOP] PDP IP still good: "); Serial.println(ip);
+      }
+
+      NetErr e = syncTimeViaNTP(8000);
+      if (e != NetErr::OK) e = syncTimeViaHTTPDate_IP();
+      if (e == NetErr::OK) {
+        Serial.println("Recovered time sync; switching to device timestamps.");
+        useServerTimestamp = false;
+      }
+    }
+
+
+
     //  This is where we do the sample averaging and message creation!
     calcSamples(currentSampleNo);
     createAndSendJsonMsg(); 
@@ -448,6 +710,17 @@ void loop()
     //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
     if(sampleHour == 23 && sampleMinute == 59){
       rain24hrTipsCounter = 0;
+
+      if (useServerTimestamp) {  //  If Time has not sync'd.  Try every 24hrs.
+        NetErr e = syncTimeViaNTP(8000);
+        if (e != NetErr::OK) {
+          e = syncTimeViaHTTPDate_IP();
+        }
+        if (e == NetErr::OK) {
+          Serial.println("Recovered time sync; switching to device timestamps.");
+          useServerTimestamp = false;
+        }
+      }
     }
   }
 
@@ -582,84 +855,28 @@ void storeSamples(uint16_t no_of_samples){
 
 // Create Json message to send
 void createAndSendJsonMsg(){
-  String payload;
-  payload.reserve(2048);
-Serial.println("createAndSendJsonMsg");
-  if(SENSORS_MODE == 0){  //Rain and River Level
-    payload += "[";
-    payload += "{\"ts\":";
-    payload += tsSendValue;   // uint32_t seconds
-    payload += "000";       // ms
-    payload += ",\"values\":";
-    payload += "{";
-    payload += "\"device\":\"";
-    payload += DEVICE_ID;
-    payload += "\",";
-    payload += "\"batV\":";
-    payload += batteryVolts;
-    payload += ",\"rlAve\":";
-    payload += riverLevelAveSendValue;
-    #if ENABLE_MAX_MIN_RL
-    payload += ",\"rlMax\":";
-      payload += riverLevelMaxSendValue;
-      payload += ",\"rlMin\":";
-      payload += riverLevelMinSendValue;
-    #endif
-    payload += ",\"rainInt\":";
-    payload += rainIntervalSendValue;
-    payload += ",\"rain24hr\":";
-    payload += rain24hrSendValue;
-    payload += "}}";
-    payload += "]";
-  }
-  if(SENSORS_MODE == 1){  //Rain only
-    payload += "[";
-    payload += "{\"ts\":";
-    payload += tsSendValue;   // uint32_t seconds
-    payload += "000";       // ms
-    payload += ",\"values\":";
-    payload += "{";
-    payload += "\"device\":\"";
-    payload += DEVICE_ID;
-    payload += "\",";
-    payload += "\"rainInt\":";
-    payload += rainIntervalSendValue;
-    payload += ",\"rain24hr\":";
-    payload += rain24hrSendValue;
-    payload += "}}";
-    payload += "]";
-  }
-  if(SENSORS_MODE == 2){  //River Level only
-    payload += "[";
-    payload += "{\"ts\":";
-    payload += tsSendValue;   // uint32_t seconds
-    payload += "000";       // ms
-    payload += ",\"values\":";
-    payload += "{";
-    payload += "\"device\":\"";
-    payload += DEVICE_ID;
-    payload += "\",";
-    payload += "\"riverLevelAve\":";
-    payload += riverLevelAveSendValue;
-    #if ENABLE_MAX_MIN_RL
-      payload += ",\"riverLevelMax\":";
-      payload += riverLevelMaxSendValue;
-      payload += ",\"riverLevelMin\":";
-      payload += riverLevelMinSendValue;
-    #endif
-    payload += "}}";
-    payload += "]";
+  // Try time sync opportunistically (optional—use your backoff logic if added)
+  if ((int32_t)(millis() - nextTimeSyncMs) >= 0) {
+    Serial.println("[TIME] Attempting sync...");
+    NetErr e = syncTimeViaNTP(12000);
+    if (e != NetErr::OK) e = syncTimeViaHTTPDate_IP();
+    if (e == NetErr::OK) { useServerTimestamp = false; scheduleNextTimeSync(true); }
+    else { useServerTimestamp = true; scheduleNextTimeSync(false); }
   }
 
-Serial.println("mqttClient.beginMessage");
-  mqttClient.beginMessage(TB_TOPIC);
-  mqttClient.print(payload);
-  mqttClient.endMessage();
+  // Publish
+  bool pubOK = publishTelemetryReliable();
 
-  #if ENABLE_DEBUG
-    Serial.print("Sent: "); Serial.println(payload);
-  #endif
+  // Stay awake a touch after publish so bytes drain
+  if (pubOK) {
+    unsigned long t0 = millis();
+    while (millis() - t0 < 600) { mqttClient.poll(); delay(20); }
+  } else {
+    Serial.println("[PUB] Telemetry publish failed.");
+  }
+
 }
+
 
 
 ///////////////////////////////////////////////////////////

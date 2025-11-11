@@ -95,6 +95,12 @@ volatile bool rainWakeFlag = false;
 bool sendMsgFlag = false;
 bool goToSleepFlag = false;
 
+
+// --- Time sync state ---
+bool useServerTimestamp = true;                 // start with TB server time until we sync
+uint32_t nextTimeSyncMs = 0;                    // millis() when we may try again
+uint32_t timeSyncBackoffMs = 5UL*60UL*1000UL;   // start with 5 minutes
+
 // Pins
 const int PIN_RAIN = 7;  // contact-closure input (to GND)
 const int PIN_RL_EN = 6;  // River Level Enable
@@ -117,8 +123,8 @@ uint16_t rain24hr = 0;
 uint16_t currentSampleNo = 0;
 uint32_t tsSendValue = 0;
 float riverLevelAveSendValue = 0;
-float riverLevelMaxSendValue = 0;    //  This equals the minimum river level in mm.
-float riverLevelMinSendValue = riverLevelRange; //  This equals the maximum river level in mm.
+float riverLevelMaxSendValue = 0;    //  This equals the minimum river level in cm.
+float riverLevelMinSendValue = riverLevelRange; //  This equals the maximum river level in cm.
 float rainIntervalSendValue = 0;
 float rain24hrSendValue = 0;
 uint8_t sampleYear;
@@ -140,7 +146,7 @@ void resetAlarms(){
 //  - Calls NB.begin(PIN, APN, USER, PASS) once
 //  - Then nudges gprs.attachGPRS() and polls for a non-zero IP
 //  - If no IP within the window, does one clean modem refresh and retries once
-bool nbAttachAPN(uint32_t pdpDeadlineMs = 30000) {
+bool nbAttachAPN(uint32_t pdpDeadlineMs) {
   Serial.println("[NET] NB.begin(PIN+APN)...");
   int st = nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS);
   Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
@@ -239,7 +245,196 @@ bool publishTelemetryJSON(const char* topic, const String& json) {
   return ok;
 }
 
+void scheduleNextTimeSync(bool success) {
+  if (success) {
+    // after success, relax retries (e.g., 6h; change to 24h if you prefer)
+    timeSyncBackoffMs = 6UL * 60UL * 60UL * 1000UL;
+  } else {
+    // exponential backoff up to 6h
+    if (timeSyncBackoffMs < 6UL * 60UL * 60UL * 1000UL)
+      timeSyncBackoffMs *= 2;
+  }
+  // jitter ±20% to avoid “sync storms”
+  uint32_t j = timeSyncBackoffMs / 5;
+  nextTimeSyncMs = millis() + (timeSyncBackoffMs - j + (rand() % (2*j + 1)));
+  Serial.print("[TIME] Next sync in ~");
+  Serial.print(timeSyncBackoffMs / 60000);
+  Serial.println(" min");
+}
 
+// Return true on success, sets TimeLib + RTCZero
+bool syncTimeViaNTP_UDP(uint32_t overallMs = 15000) {
+  Serial.println("[NTP] Start");
+  NBUDP ntpUdp;  // fresh socket avoids stale state
+
+  // patient UDP open on ephemeral port
+  auto openUDP = [&](uint32_t totalMs)->bool {
+    unsigned long t0 = millis();
+    uint16_t attempt = 0;
+    while (millis() - t0 < totalMs) {
+      if (ntpUdp.begin(localPort)) return true;   // ephemeral local port
+      ntpUdp.stop();
+      delay(min<uint16_t>(150 + attempt*150, 800));
+      attempt++;
+    }
+    return false;
+  };
+
+  if (!openUDP(8000)) {
+    Serial.println("[NTP] UDP open failed");
+    ntpUdp.stop();
+    return false;
+  }
+
+  // NTP packet
+  const int NTP_PACKET_SIZE = 48;
+  static uint8_t pkt[NTP_PACKET_SIZE];
+  memset(pkt, 0, NTP_PACKET_SIZE);
+  pkt[0] = 0b11100011;   // LI, Version, Mode
+  pkt[2] = 6;            // Polling
+  pkt[3] = 0xEC;         // Precision
+  pkt[12]=49; pkt[13]=0x4E; pkt[14]=49; pkt[15]=52;
+
+  // DNS-free anycast/time hosts
+  const IPAddress servers[] = {
+    IPAddress(129, 6, 15, 28),   // time.nist.gov
+    IPAddress(216, 239, 35, 0),  // time.google.com
+    IPAddress(162, 159, 200, 1)  // time.cloudflare.com
+  };
+
+  auto tryOne = [&](const IPAddress& ip)->bool {
+    if (!ntpUdp.beginPacket(ip, 123)) return false;
+    ntpUdp.write(pkt, NTP_PACKET_SIZE);
+    if (!ntpUdp.endPacket()) return false;
+
+    unsigned long t0 = millis();
+    while (millis() - t0 < 2500) {
+      int sz = ntpUdp.parsePacket();
+      if (sz >= NTP_PACKET_SIZE) {
+        ntpUdp.read(pkt, NTP_PACKET_SIZE);
+        uint32_t secs1900 =
+          (uint32_t(pkt[40])<<24)|(uint32_t(pkt[41])<<16)|(uint32_t(pkt[42])<<8)|uint32_t(pkt[43]);
+        const uint32_t seventyYears = 2208988800UL;
+        if (secs1900 > seventyYears) {
+          time_t epoch = secs1900 - seventyYears;
+          setTime(epoch);
+          rtc.setTime(hour(), minute(), second());
+          rtc.setDate(day(), month(), (year()-2000));
+          Serial.print("[NTP] OK epoch "); Serial.println(epoch);
+          return true;
+        }
+      }
+      delay(50);
+    }
+    return false;
+  };
+
+  unsigned long start = millis();
+  bool ok = false;
+  for (const auto& ip : servers) {
+    if (millis() - start > overallMs) break;
+    if (tryOne(ip)) { ok = true; break; }
+  }
+  ntpUdp.stop();
+  if (!ok) Serial.println("[NTP] No reply");
+  return ok;
+}
+
+// Return true on success, sets TimeLib + RTCZero
+bool syncTimeViaHTTPDate_IP(uint32_t connectMs = 6000) {
+  Serial.println("[HTTP-Date] Start");
+  NBClient http;
+  IPAddress hostIP(93, 184, 216, 34); // example.com
+
+  if (!http.connect(hostIP, 80)) {
+    Serial.println("[HTTP-Date] TCP connect failed");
+    http.stop();
+    return false;
+  }
+
+  http.print(
+    "GET / HTTP/1.1\r\n"
+    "Host: example.com\r\n"
+    "Connection: close\r\n\r\n"
+  );
+
+  unsigned long t0 = millis();
+  while (!http.available() && millis() - t0 < connectMs) delay(50);
+
+  String line, dateLine;
+  while (http.connected()) {
+    int c = http.read();
+    if (c < 0) { delay(5); continue; }
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (line.length() == 0) break;          // end headers
+      if (line.startsWith("Date:")) dateLine = line;
+      line = "";
+    } else line += char(c);
+  }
+  http.stop();
+
+  if (dateLine.length() == 0) { Serial.println("[HTTP-Date] No Date header"); return false; }
+
+  // "Date: Wed, 12 Nov 2025 15:22:12 GMT"
+  int comma = dateLine.indexOf(',');
+  int sp1 = dateLine.indexOf(' ', comma+1);
+  if (comma < 0 || sp1 < 0) return false;
+  String rest = dateLine.substring(sp1+1); rest.trim();  // "12 Nov 2025 15:22:12 GMT"
+
+  int s1 = rest.indexOf(' ');
+  int s2 = rest.indexOf(' ', s1+1);
+  int s3 = rest.indexOf(' ', s2+1);
+  if (s1<0 || s2<0 || s3<0) return false;
+
+  int d = rest.substring(0, s1).toInt();
+  String mon = rest.substring(s1+1, s2);
+  int yy = rest.substring(s2+1, s3).toInt();
+  String hms = rest.substring(s3+1);
+  int spGMT = hms.indexOf(' '); if (spGMT > 0) hms = hms.substring(0, spGMT);
+  int c1 = hms.indexOf(':'), c2 = hms.indexOf(':', c1+1);
+  if (c1<0 || c2<0) return false;
+  int hh = hms.substring(0, c1).toInt();
+  int mm = hms.substring(c1+1, c2).toInt();
+  int ss = hms.substring(c2+1).toInt();
+
+  int monthNum =
+    (mon=="Jan")?1:(mon=="Feb")?2:(mon=="Mar")?3:(mon=="Apr")?4:(mon=="May")?5:
+    (mon=="Jun")?6:(mon=="Jul")?7:(mon=="Aug")?8:(mon=="Sep")?9:(mon=="Oct")?10:
+    (mon=="Nov")?11:(mon=="Dec")?12:0;
+  if (!monthNum) return false;
+
+  tmElements_t tme;
+  tme.Second = ss; tme.Minute = mm; tme.Hour = hh;
+  tme.Day = d; tme.Month = monthNum; tme.Year = yy - 1970;
+  time_t epoch = makeTime(tme);
+  if (epoch < 1609459200UL) return false; // sanity >= 2021
+
+  setTime(epoch);
+  rtc.setTime(hour(), minute(), second());
+  rtc.setDate(day(), month(), (year()-2000));
+  Serial.print("[HTTP-Date] OK epoch "); Serial.println(epoch);
+  return true;
+}
+
+// Try once now (UDP first, then HTTP). Update flags & schedule next.
+bool timeSyncOnce() {
+  bool ok = syncTimeViaNTP_UDP(15000);
+  if (!ok) ok = syncTimeViaHTTPDate_IP(6000);
+
+  useServerTimestamp = !ok;
+  scheduleNextTimeSync(ok);
+  Serial.println(ok ? "[TIME] Sync OK (device timestamps enabled)"
+                    : "[TIME] Sync FAILED (using TB server timestamps)");
+  return ok;
+}
+
+// call periodically (e.g., in loop): only runs when due
+void timeSyncTick() {
+  if ((int32_t)(millis() - nextTimeSyncMs) >= 0) {
+    timeSyncOnce();
+  }
+}
 
 ///////////////////////////////////////////////////////////
 //  SETUP
@@ -273,22 +468,27 @@ void setup() {
   }
 
   // After you printed PDP IP and before first publish:
-setupMqttClient();
+  setupMqttClient();
 
-if (!ensureMqttConnected(TB_HOST, TB_PORT)) {
-  // Optional: single re-attach then one more try
-  Serial.println("[BOOT] MQTT connect failed; will try once more after PDP refresh...");
-  gprs.detachGPRS(); delay(600);
-  // reuse your working APN attach path here
-  if (nbAttachAPN(20000)) {
-    (void)ensureMqttConnected(TB_HOST, TB_PORT);
+  if (!ensureMqttConnected(TB_HOST, TB_PORT)) {
+    // Optional: single re-attach then one more try
+    Serial.println("[BOOT] MQTT connect failed; will try once more after PDP refresh...");
+    gprs.detachGPRS(); delay(600);
+    // reuse your working APN attach path here
+    if (nbAttachAPN(20000)) {
+      (void)ensureMqttConnected(TB_HOST, TB_PORT);
+    }
   }
-}
+
+  timeSyncOnce();
+  // plan first attempt soon (uses backoff if it fails)
+  scheduleNextTimeSync(false);
 
   // Give the modem ~1s to flush
   unsigned long t1 = millis();
   while (millis() - t1 < 1000) { mqttClient.poll(); delay(20); }
   Serial.println("[DONE] Connect.");
+
 }
 
 
@@ -299,6 +499,12 @@ if (!ensureMqttConnected(TB_HOST, TB_PORT)) {
 ///////////////////////////////////////////////////////////
 void loop()
 {
+
+  // opportunistic maintenance; won't run if not yet due
+  if (!mqttClient.connected()) {   // <- don't poke sockets when MQTT is up
+    timeSyncTick();
+  }
+
   mqttClient.poll(); // keepalive
 //takeRiverLevelSamples(currentSampleNo);  //RL TEST
 //delay(1000);
@@ -359,6 +565,12 @@ void loop()
     //  This is where we do the sample averaging and message creation!
     calcSamples(currentSampleNo);
     createAndSendJsonMsg(); 
+
+    // after publish + drain
+    if (!mqttClient.connected()) {
+      timeSyncTick();
+    }
+
 
     //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
     if(sampleHour == 23 && sampleMinute == 59){
@@ -495,57 +707,88 @@ void storeSamples(uint16_t no_of_samples){
 }
 
 // Create Json message to send
-// Create Json message to send
 void createAndSendJsonMsg(){
   String payload;
   payload.reserve(2048);
 
-  if (SENSORS_MODE == 0) {  // Rain and River Level
-    payload += "[";
-    payload += "{\"ts\":";
-    payload += tsSendValue;   // uint32_t seconds
-    payload += "000";         // ms
-    payload += ",\"values\":{";
-    payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
-    payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
-    payload += "\"rlAve\":";   payload += riverLevelAveSendValue;    payload += ",";
-    payload += "\"rlMax\":";   payload += riverLevelMaxSendValue;    payload += ",";
-    payload += "\"rlMin\":";   payload += riverLevelMinSendValue;    payload += ",";
-    payload += "\"rainInt\":"; payload += rainIntervalSendValue;     payload += ",";
-    payload += "\"rain24hr\":";payload += rain24hrSendValue;
-    payload += "}}]";
-  }
-  if (SENSORS_MODE == 1) {  // Rain only
-    payload += "[";
-    payload += "{\"ts\":";
-    payload += tsSendValue;  payload += "000";
-    payload += ",\"values\":{";
-    payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
-    payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
-    payload += "\"rain24hr\":"; payload += rain24hrSendValue;
-    payload += "}}]";
-  }
-  if (SENSORS_MODE == 2) {  // River Level only
-    payload += "[";
-    payload += "{\"ts\":";
-    payload += tsSendValue;  payload += "000";
-    payload += ",\"values\":{";
-    payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
-    payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; payload += ",";
-    payload += "\"riverLevelMax\":"; payload += riverLevelMaxSendValue; payload += ",";
-    payload += "\"riverLevelMin\":"; payload += riverLevelMinSendValue;
-    payload += "}}]";
+  if (!useServerTimestamp) {
+    // use device timestamp (array with ts + values)
+    uint32_t ts = rtc.getEpoch();     // seconds since 1970
+    if (SENSORS_MODE == 0) {
+      payload += "[{\"ts\":"; payload += ts; payload += "000";
+      payload += ",\"values\":{";
+      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
+      payload += "\"rlAve\":";   payload += riverLevelAveSendValue;    payload += ",";
+      #if ENABLE_MAX_MIN_RL
+      payload += "\"rlMax\":";   payload += riverLevelMaxSendValue;    payload += ",";
+      payload += "\"rlMin\":";   payload += riverLevelMinSendValue;    payload += ",";
+      #endif
+      payload += "\"rainInt\":"; payload += rainIntervalSendValue;     payload += ",";
+      payload += "\"rain24hr\":";payload += rain24hrSendValue;
+      payload += "}}]";
+    } else if (SENSORS_MODE == 1) {
+      payload += "[{\"ts\":"; payload += ts; payload += "000";
+      payload += ",\"values\":{";
+      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
+      payload += "\"rain24hr\":"; payload += rain24hrSendValue;
+      payload += "}}]";
+    } else { // 2
+      payload += "[{\"ts\":"; payload += ts; payload += "000";
+      payload += ",\"values\":{";
+      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; 
+      #if ENABLE_MAX_MIN_RL
+      payload += ",";
+      payload += "\"riverLevelMax\":"; payload += riverLevelMaxSendValue; payload += ",";
+      payload += "\"riverLevelMin\":"; payload += riverLevelMinSendValue;
+      #endif
+      payload += "}}]";
+    }
+  } else {
+    // server timestamp: plain object (no ts, no "values" wrapper)
+    if (SENSORS_MODE == 0) {
+      payload += "{";
+      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
+      payload += "\"rlAve\":";   payload += riverLevelAveSendValue;    payload += ",";
+      #if ENABLE_MAX_MIN_RL
+      payload += "\"rlMax\":";   payload += riverLevelMaxSendValue;    payload += ",";
+      payload += "\"rlMin\":";   payload += riverLevelMinSendValue;    payload += ",";
+      #endif
+      payload += "\"rainInt\":"; payload += rainIntervalSendValue;     payload += ",";
+      payload += "\"rain24hr\":";payload += rain24hrSendValue;
+      payload += "}";
+    } else if (SENSORS_MODE == 1) {
+      payload += "{";
+      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
+      payload += "\"rain24hr\":"; payload += rain24hrSendValue;
+      payload += "}";
+    } else {
+      payload += "{";
+      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; 
+      #if ENABLE_MAX_MIN_RL
+      payload += ",";
+      payload += "\"riverLevelMax\":"; payload += riverLevelMaxSendValue; payload += ",";
+      payload += "\"riverLevelMin\":"; payload += riverLevelMinSendValue;
+      #endif
+      payload += "}";
+    }
   }
 
-  // Hardened publish (ensures connect + drains)
+  // Hardened publish you already added:
   bool ok = publishTelemetryJSON(TB_TOPIC, payload);
 
-  #if ENABLE_DEBUG
-    Serial.print("Sent: "); Serial.println(payload);
-    if (!ok) Serial.println("[PUB] Telemetry send failed");
-    flashLED(ok ? 1 : 3, 200);   // 1 blink on success, 3 on fail
-  #endif
+#if ENABLE_DEBUG
+  Serial.print("Sent: "); Serial.println(payload);
+  if (!ok) Serial.println("[PUB] Telemetry send failed");
+  flashLED(ok ? 1 : 3, 200);
+#endif
 }
+
 
 
 

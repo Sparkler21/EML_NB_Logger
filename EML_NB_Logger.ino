@@ -81,6 +81,7 @@ unsigned int localPort = 2390;      // local port to listen for UDP packets
 RTCZero rtc;
 GPRS gprs;
 NB nbAccess;
+NBScanner scanner;
 NBClient nbClient;
 MqttClient mqttClient(nbClient);
 // A UDP instance to let us send and receive packets over UDP
@@ -135,52 +136,44 @@ void resetAlarms(){
     rtc.enableAlarm(rtc.MATCH_SS);
 }
 
-// Bring modem up, register, attach PDP, and wait for an IP.
-// Uses PIN-only begin (most reliable on MKR NB 1500 variants).
-bool nbAttachSimple(uint32_t regDeadlineMs = 25000, uint32_t pdpDeadlineMs = 30000) {
-  Serial.println("[NET] NB.begin(PINONLY)...");
-  int st = nbAccess.begin(PINNUMBER);          // don’t loop this; some cores misbehave
-  Serial.print("[NET] NB.begin -> "); Serial.println(st);
+// Attach with APN path only.
+//  - Calls NB.begin(PIN, APN, USER, PASS) once
+//  - Then nudges gprs.attachGPRS() and polls for a non-zero IP
+//  - If no IP within the window, does one clean modem refresh and retries once
+bool nbAttachAPN(uint32_t pdpDeadlineMs = 30000) {
+  Serial.println("[NET] NB.begin(PIN+APN)...");
+  int st = nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS);
+  Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
 
-  // Proceed even if not NB_READY; some stacks still allow PDP
+  // Observability
+  Serial.print("[NET] CEREG: "); Serial.println(nbAccess.isAccessAlive()); // 1/5 good
+  Serial.print("[NET] CSQ: ");   Serial.println(scanner.getSignalStrength()); // "0..31" or "99"
+
+  Serial.println("[NET] Starting PDP bring-up...");
   unsigned long t0 = millis();
-  bool haveIP = false;
-  bool kicked = false;
-
-  Serial.println("[NET] Starting PDP bring-up (timed loop)...");
   while (millis() - t0 < pdpDeadlineMs) {
-    // “Nudge” PDP attach occasionally; keep it non-blocking
-    if (!kicked || ((millis() - t0) % 5000UL) < 100UL) {
-      (void)gprs.attachGPRS();                 // returns quickly on most cores
-      kicked = true;
-    }
-
-    IPAddress ip = gprs.getIPAddress();        // non-blocking poll
+    (void)gprs.attachGPRS();         // quick nudge; harmless if already up
+    IPAddress ip = gprs.getIPAddress();
     Serial.print("[NET] IP poll: "); Serial.println(ip);
-    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) { // got an IP
-      haveIP = true;
-      break;
+    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
+      delay(750); // small settle
+      Serial.print("[NET] PDP IP: "); Serial.println(ip);
+      return true;
     }
     delay(500);
   }
 
-  if (haveIP) {
-    // small settle for sockets
-    delay(750);
-    Serial.print("[NET] PDP IP: "); Serial.println(gprs.getIPAddress());
-    return true;
-  }
-
-  // One modem refresh attempt
-  Serial.println("[NET] PDP timed out, refreshing modem once...");
+  // One clean refresh, then try again briefly
+  Serial.println("[NET] PDP timed out. Refreshing modem and retrying APN path...");
   nbAccess.shutdown();
   delay(1500);
 
-  Serial.println("[NET] NB.begin(PINONLY) after refresh...");
-  st = nbAccess.begin(PINNUMBER);
-  Serial.print("[NET] NB.begin -> "); Serial.println(st);
+  Serial.println("[NET] NB.begin(PIN+APN) (retry)...");
+  st = nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS);
+  Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
+  Serial.print("[NET] CEREG: "); Serial.println(nbAccess.isAccessAlive());
+  Serial.print("[NET] CSQ: ");   Serial.println(scanner.getSignalStrength());
 
-  // Try PDP again with a shorter window
   t0 = millis();
   while (millis() - t0 < 15000) {
     (void)gprs.attachGPRS();
@@ -194,90 +187,113 @@ bool nbAttachSimple(uint32_t regDeadlineMs = 25000, uint32_t pdpDeadlineMs = 300
     delay(500);
   }
 
-  Serial.println("[NET] PDP attach failed after refresh.");
+  Serial.println("[NET] PDP attach failed (APN path).");
   return false;
 }
 
-
-// Map ArduinoMqttClient connectError() for clarity
 void printMqttErr(int e) {
   Serial.print("[MQTT] connectError="); Serial.println(e);
   switch (e) {
     case -1: Serial.println("[MQTT] Timeout waiting for CONNACK"); break;
     case -2: Serial.println("[MQTT] TCP connect failed (PDP/DNS/firewall)"); break;
     case -3: Serial.println("[MQTT] Protocol/broker rejected"); break;
-    case -4: Serial.println("[MQTT] Auth/token rejected"); break;
+    case -4: Serial.println("[MQTT] Auth/token rejected (check device token)"); break;
     default: Serial.println("[MQTT] Unknown error"); break;
   }
 }
+
+// --- MQTT helpers ---
+void setupMqttClient() {
+  mqttClient.setId(DEVICE_ID);                 // non-empty clientId (yours)
+  mqttClient.setUsernamePassword(TB_TOKEN, ""); // TB token as username, blank password
+  mqttClient.setKeepAliveInterval(45 * 1000);   // NB/LTE-M friendly
+  mqttClient.beginWill("v1/devices/me/attributes", false, 0);
+  mqttClient.print("{\"status\":\"offline\"}");
+  mqttClient.endWill();
+}
+
+// Try connect if needed (no infinite wait)
+bool ensureMqttConnected(const char* host, int port) {
+  if (mqttClient.connected()) return true;
+  Serial.print("[MQTT] Connecting to "); Serial.print(host); Serial.print(":"); Serial.println(port);
+  if (!mqttClient.connect(host, port)) {
+    Serial.print("[MQTT] connectError="); Serial.println(mqttClient.connectError());
+    return false;
+  }
+  Serial.println("[MQTT] Connected.");
+  return true;
+}
+
+// Publish JSON and give the modem time to flush
+bool publishTelemetryJSON(const char* topic, const String& json) {
+  if (!ensureMqttConnected(TB_HOST, TB_PORT)) return false;
+  if (!mqttClient.beginMessage(topic)) {
+    Serial.println("[PUB] beginMessage() failed");
+    return false;
+  }
+  mqttClient.print(json);
+  bool ok = mqttClient.endMessage();
+  Serial.print("[PUB] endMessage() -> "); Serial.println(ok ? "OK" : "FAIL");
+  unsigned long t0 = millis();
+  while (millis() - t0 < 800) { mqttClient.poll(); delay(20); }  // drain ~0.8s
+  return ok;
+}
+
+
 
 ///////////////////////////////////////////////////////////
 //  SETUP
 ///////////////////////////////////////////////////////////
 void setup() {
+
+  //Pins
   pinMode(LED_BUILTIN, OUTPUT);
+  // Rain input
+  pinMode(PIN_RAIN, INPUT_PULLUP);
+  LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
+  
+  analogReadResolution(12);
+
+  //Serial Comms
   Serial.begin(115200);
   unsigned long t0 = millis(); while (!Serial && millis()-t0 < 4000) {}
   Serial.println("\n\n=== BOOT ===");
 
-  // 1) Attach
-  if (!nbAttachSimple(25000)) {
-    Serial.println("[BOOT] PDP attach failed. Will not proceed.");
+  // RTC Setup
+  rtc.begin(); // initialize RTC 24H format
+  rtc.setAlarmSeconds(0);
+  rtc.setAlarmSeconds(RTC_ALARM_SECOND);
+  rtc.enableAlarm(rtc.MATCH_SS);
+  rtc.attachInterrupt(rtcWakeISR);
+
+  // Attach via APN
+  if (!nbAttachAPN(30000)) {
+    Serial.println("[BOOT] PDP attach failed with APN. Stop here.");
     return;
   }
 
+  // After you printed PDP IP and before first publish:
+setupMqttClient();
 
-
-  // 3) MQTT connect (token as username, empty password)
-  mqttClient.setId("MKRNB_TEST");
-  mqttClient.setUsernamePassword(TB_TOKEN, "");
-
-  Serial.print("[MQTT] Connecting to "); Serial.print(TB_HOST); Serial.print(":"); Serial.println(TB_PORT);
-  if (!mqttClient.connect(TB_HOST, TB_PORT)) {
-    int e = mqttClient.connectError();
-    printMqttErr(e);
-
-    // If this prints "TCP connect failed" and tcpProbeExample() also failed,
-    // the data plane is down -> reattach once, then stop.
-    if (e == -2) {
-      Serial.println("[MQTT] Trying one re-attach and retry...");
-      gprs.detachGPRS(); delay(600);
-      if (nbAttachSimple(20000)) {
-        Serial.print("[MQTT] Retrying connect... ");
-        if (!mqttClient.connect(TB_HOST, TB_PORT)) {
-          printMqttErr(mqttClient.connectError());
-          Serial.println("[MQTT] Still failing; stop here for now.");
-          return;
-        }
-      } else {
-        Serial.println("[MQTT] Re-attach failed; stop here.");
-        return;
-      }
-    } else {
-      Serial.println("[MQTT] Non-TCP error; stop here.");
-      return;
-    }
+if (!ensureMqttConnected(TB_HOST, TB_PORT)) {
+  // Optional: single re-attach then one more try
+  Serial.println("[BOOT] MQTT connect failed; will try once more after PDP refresh...");
+  gprs.detachGPRS(); delay(600);
+  // reuse your working APN attach path here
+  if (nbAttachAPN(20000)) {
+    (void)ensureMqttConnected(TB_HOST, TB_PORT);
   }
-  Serial.println("[MQTT] Connected.");
+}
 
-  // 4) Send a single tiny test message and keep link alive briefly
-  Serial.println("[PUB] Sending test payload...");
-  mqttClient.beginMessage("v1/devices/me/telemetry");
-  mqttClient.print("{\"hello\":1}");
-  bool ok = mqttClient.endMessage();
-  Serial.print("[PUB] endMessage() -> "); Serial.println(ok ? "OK" : "FAIL");
-
+  // Give the modem ~1s to flush
   unsigned long t1 = millis();
   while (millis() - t1 < 1000) { mqttClient.poll(); delay(20); }
-
-  Serial.println("[DONE] Minimal connect+publish path finished.");
+  Serial.println("[DONE] Connect.");
 }
 
-void loop() {
-  // empty while testing connection
-}
 
-/*
+
+
 ///////////////////////////////////////////////////////////
 //  START OF LOOP
 ///////////////////////////////////////////////////////////
@@ -366,7 +382,7 @@ void loop()
 ///////////////////////////////////////////////////////////
 //  END OF LOOP
 ///////////////////////////////////////////////////////////
-*/
+
 /****************************************************************/
 //                        FUNCTIONS                             //
 /****************************************************************/
@@ -394,12 +410,12 @@ void takeRiverLevelSamples(uint16_t no_of_samples) {
   // Read River Level ADC(0)
   uint32_t adc = 0;
   const int N = 10;
-  
+
   //POWER UP SENSOR
   digitalWrite(PIN_RL_EN, HIGH);
   //SMALL DELAY of MORE THAN 20uS
   delay(50); // small delay between samples  
-  
+
   for (int i = 0; i < N; i++) {
     //adc = ads.readADC_SingleEnded(0);
     adc = adc + analogRead(2);
@@ -412,12 +428,14 @@ void takeRiverLevelSamples(uint16_t no_of_samples) {
   currentRiverLevel = ((currentRiverLevel/4095.0) * 3300)/3.2;
   adc = 0;  // reset
   riverLevelTotal = riverLevelTotal + currentRiverLevel;  //  Totalise the river level samples
-  if(riverLevelMax < currentRiverLevel){
-    riverLevelMax = currentRiverLevel;  //  New Max in the samples
-  }
-  if(riverLevelMin > currentRiverLevel){
-    riverLevelMin = currentRiverLevel;  //  New Min in the samples
-  }
+  #if ENABLE_MAX_MIN_RL
+    if(riverLevelMax < currentRiverLevel){
+      riverLevelMax = currentRiverLevel;  //  New Max in the samples
+    }
+    if(riverLevelMin > currentRiverLevel){
+      riverLevelMin = currentRiverLevel;  //  New Min in the samples
+    }
+  #endif
 
   #if ENABLE_DEBUG
     Serial.print(sampleYear+2000); Serial.print("-"); Serial.print(sampleMonth); Serial.print("-"); Serial.print(sampleDay);
@@ -425,16 +443,19 @@ void takeRiverLevelSamples(uint16_t no_of_samples) {
     Serial.print(sampleHour); Serial.print(":"); Serial.print(sampleMinute); Serial.print(":"); Serial.print(sampleSecond); Serial.print(", ");
     Serial.print("Sample No = "); Serial.print(no_of_samples); Serial.print(", ");
     Serial.print("RiverLevel-Current = "); Serial.print(currentRiverLevel); Serial.print(", ");
-    Serial.print("RiverLevel-Total = "); Serial.print(riverLevelTotal); Serial.print(", ");
-    Serial.print("RiverLevel-Max = "); Serial.print(riverLevelMax); Serial.print(", ");
-    Serial.print("RiverLevel-Min = "); Serial.println(riverLevelMin);
+    Serial.print("RiverLevel-Total = "); Serial.print(riverLevelTotal); 
+    #if ENABLE_MAX_MIN_RL
+      Serial.print(", ");
+      Serial.print("RiverLevel-Max = "); Serial.print(riverLevelMax); Serial.print(", ");
+      Serial.print("RiverLevel-Min = "); Serial.println(riverLevelMin);
+    #endif
   #endif
 }
 
 void takeRainSamples(uint16_t no_of_samples) {
 
   #if ENABLE_DEBUG
-    Serial.print(sampleYear+2000); Serial.print("-"); Serial.print(sampleMonth); Serial.print("-"); Serial.print(sampleDay);
+    Serial.println(sampleYear+2000); Serial.print("-"); Serial.print(sampleMonth); Serial.print("-"); Serial.print(sampleDay);
     Serial.print(" ");
     Serial.print(sampleHour); Serial.print(":"); Serial.print(sampleMinute); Serial.print(":"); Serial.print(sampleSecond); Serial.print(", ");
     Serial.print("Sample No = "); Serial.print(no_of_samples); Serial.print(", ");
@@ -445,14 +466,16 @@ void takeRainSamples(uint16_t no_of_samples) {
 
 // Process Sensors Function (inc Rain Reset if day change?)
 void calcSamples(uint16_t no_of_samples){
-
+Serial.println("calcSamples");
   if(SENSORS_MODE == 0 || SENSORS_MODE == 2){  //River Level
     riverLevelAveSendValue = riverLevelTotal/no_of_samples;  //  Calculate the average river level during the sampling period
-    riverLevelMaxSendValue = riverLevelMax;
-    riverLevelMinSendValue = riverLevelMin;
+    #if ENABLE_MAX_MIN_RL
+      riverLevelMaxSendValue = riverLevelMax;
+      riverLevelMinSendValue = riverLevelMin;
+      riverLevelMax = 0;
+      riverLevelMin = riverLevelRange;
+    #endif
     riverLevelTotal = 0;
-    riverLevelMax = 0;
-    riverLevelMin = riverLevelRange;
   }
 
   if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
@@ -472,80 +495,58 @@ void storeSamples(uint16_t no_of_samples){
 }
 
 // Create Json message to send
+// Create Json message to send
 void createAndSendJsonMsg(){
   String payload;
   payload.reserve(2048);
 
-  if(SENSORS_MODE == 0){  //Rain and River Level
+  if (SENSORS_MODE == 0) {  // Rain and River Level
     payload += "[";
     payload += "{\"ts\":";
     payload += tsSendValue;   // uint32_t seconds
-    payload += "000";       // ms
-    payload += ",\"values\":";
-    payload += "{";
-    payload += "\"device\":\"";
-    payload += DEVICE_ID;
-    payload += "\",";
-    payload += "\"batV\":";
-    payload += batteryVolts;
-    payload += ",\"rlAve\":";
-    payload += riverLevelAveSendValue;
-    payload += ",\"rlMax\":";
-    payload += riverLevelMaxSendValue;
-    payload += ",\"rlMin\":";
-    payload += riverLevelMinSendValue;
-    payload += ",\"rainInt\":";
-    payload += rainIntervalSendValue;
-    payload += ",\"rain24hr\":";
-    payload += rain24hrSendValue;
-    payload += "}}";
-    payload += "]";
+    payload += "000";         // ms
+    payload += ",\"values\":{";
+    payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+    payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
+    payload += "\"rlAve\":";   payload += riverLevelAveSendValue;    payload += ",";
+    payload += "\"rlMax\":";   payload += riverLevelMaxSendValue;    payload += ",";
+    payload += "\"rlMin\":";   payload += riverLevelMinSendValue;    payload += ",";
+    payload += "\"rainInt\":"; payload += rainIntervalSendValue;     payload += ",";
+    payload += "\"rain24hr\":";payload += rain24hrSendValue;
+    payload += "}}]";
   }
-  if(SENSORS_MODE == 1){  //Rain only
+  if (SENSORS_MODE == 1) {  // Rain only
     payload += "[";
     payload += "{\"ts\":";
-    payload += tsSendValue;   // uint32_t seconds
-    payload += "000";       // ms
-    payload += ",\"values\":";
-    payload += "{";
-    payload += "\"device\":\"";
-    payload += DEVICE_ID;
-    payload += "\",";
-    payload += "\"rainInt\":";
-    payload += rainIntervalSendValue;
-    payload += ",\"rain24hr\":";
-    payload += rain24hrSendValue;
-    payload += "}}";
-    payload += "]";
+    payload += tsSendValue;  payload += "000";
+    payload += ",\"values\":{";
+    payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+    payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
+    payload += "\"rain24hr\":"; payload += rain24hrSendValue;
+    payload += "}}]";
   }
-  if(SENSORS_MODE == 2){  //River Level only
+  if (SENSORS_MODE == 2) {  // River Level only
     payload += "[";
     payload += "{\"ts\":";
-    payload += tsSendValue;   // uint32_t seconds
-    payload += "000";       // ms
-    payload += ",\"values\":";
-    payload += "{";
-    payload += "\"device\":\"";
-    payload += DEVICE_ID;
-    payload += "\",";
-    payload += "\"riverLevelAve\":";
-    payload += riverLevelAveSendValue;
-    payload += ",\"riverLevelMax\":";
-    payload += riverLevelMaxSendValue;
-    payload += ",\"riverLevelMin\":";
-    payload += riverLevelMinSendValue;
-    payload += "}}";
-    payload += "]";
+    payload += tsSendValue;  payload += "000";
+    payload += ",\"values\":{";
+    payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+    payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; payload += ",";
+    payload += "\"riverLevelMax\":"; payload += riverLevelMaxSendValue; payload += ",";
+    payload += "\"riverLevelMin\":"; payload += riverLevelMinSendValue;
+    payload += "}}]";
   }
-  mqttClient.beginMessage(TB_TOPIC);
-  mqttClient.print(payload);
-  mqttClient.endMessage();
+
+  // Hardened publish (ensures connect + drains)
+  bool ok = publishTelemetryJSON(TB_TOPIC, payload);
 
   #if ENABLE_DEBUG
     Serial.print("Sent: "); Serial.println(payload);
-    flashLED(1, 2000);
+    if (!ok) Serial.println("[PUB] Telemetry send failed");
+    flashLED(ok ? 1 : 3, 200);   // 1 blink on success, 3 on fail
   #endif
 }
+
 
 
 ///////////////////////////////////////////////////////////

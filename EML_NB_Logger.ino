@@ -47,6 +47,8 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 #include <TimeLib.h>
 //#include <Adafruit_ADS1X15.h>
 #include <ArduinoMqttClient.h>
+#include <SPI.h>
+#include <SD.h>
 /************************************************************
  * Enables debug support. To disable this feature set to 0.
  ***********************************************************/
@@ -64,6 +66,9 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 #define SAMPLING_INTERVAL 10  // SAMPLING_INTERVAL in minutes
 uint16_t riverLevelRange = 600;  //  Currently Max range in cm
 float rainGaugeCF = 0.200;  //  Rain gauge calibration factor
+
+const int SDchipSelect = 4;
+const int FLASHchipSelect = 5;
 
 // ---- ThingsBoard EU MQTT ----
 const char TB_HOST[]   = "mqtt.eu.thingsboard.cloud"; // EU cluster
@@ -142,44 +147,120 @@ void resetAlarms(){
     rtc.enableAlarm(rtc.MATCH_SS);
 }
 
-// Attach with APN path only.
-//  - Calls NB.begin(PIN, APN, USER, PASS) once
-//  - Then nudges gprs.attachGPRS() and polls for a non-zero IP
-//  - If no IP within the window, does one clean modem refresh and retries once
-bool nbAttachAPN(uint32_t pdpDeadlineMs) {
+//  Get sampling time from RTC
+void sampleTimeandDateFromRTC(){
+  sampleSecond = rtc.getSeconds();  
+  sampleMinute = rtc.getMinutes();
+  sampleHour = rtc.getHours();
+  sampleYear = rtc.getYear();
+  sampleMonth = rtc.getMonth();
+  sampleDay = rtc.getDay();
+}
+
+String createSDfilename(){
+
+  String SDfilename = "";
+  sampleTimeandDateFromRTC();
+  SDfilename += sampleYear; SDfilename += sampleMonth; SDfilename += sampleDay; SDfilename += ".csv";
+  Serial.print("SDfilename: ");
+  Serial.println(SDfilename);
+  return SDfilename;
+}
+
+void writeSDcard(String SDfilename, String dataString){
+    Serial.print("Initializing SD card...");
+
+    // see if the card is present and can be initialized:
+    if (!SD.begin(SDchipSelect)) {
+      Serial.println("Card failed, or not present");
+      // don't do anything more:
+      while (1);
+    }
+    Serial.println("card initialized.");
+
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+  File dataFile = SD.open(SDfilename, FILE_WRITE);
+
+  // if the file is available, write to it:
+  if (dataFile) {
+    dataFile.println(dataString);
+    dataFile.close();
+    // print to the serial port too:
+    Serial.println(dataString);
+  }
+  // if the file isn't open, pop up an error:
+  else {
+    Serial.print("error opening ");
+    Serial.println(SDfilename);
+  }
+  delay(1000);
+
+}
+
+// Registration-first attach: wait for CEREG=1/5 before touching PDP
+bool nbAttachAPN(uint32_t regDeadlineMs = 45000, uint32_t pdpDeadlineMs = 30000) {
   Serial.println("[NET] NB.begin(PIN+APN)...");
   int st = nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS);
   Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
 
-  // Observability
-  Serial.print("[NET] CEREG: "); Serial.println(nbAccess.isAccessAlive()); // 1/5 good
-  Serial.print("[NET] CSQ: ");   Serial.println(scanner.getSignalStrength()); // "0..31" or "99"
-
-  Serial.println("[NET] Starting PDP bring-up...");
+  // --- Wait for network registration (CEREG 1=home, 5=roaming) ---
   unsigned long t0 = millis();
+  int lastReg = -1;
+  while (millis() - t0 < regDeadlineMs) {
+    int reg = nbAccess.isAccessAlive();   // 0 not, 1 home, 2 searching, 3 denied, 4 unknown, 5 roaming
+    if (reg != lastReg) {
+      Serial.print("[NET] CEREG: "); Serial.println(reg);
+      lastReg = reg;
+    }
+    if (reg == 1 || reg == 5) break;           // registered
+    if (reg == 3) {                             // registration denied
+      Serial.println("[NET] Registration denied (CEREG=3) — check SIM/profile/PLMN");
+      return false;
+    }
+    delay(500);
+  }
+  if (!(lastReg == 1 || lastReg == 5)) {
+    Serial.println("[NET] Registration timeout — no network attach");
+    return false;
+  }
+
+  // Optional: show signal once
+  while (scanner.getSignalStrength() == "99"){
+    //  No signal - Stay in loop!!!  TIMEOUT NEEDED??????
+  }
+  Serial.print("[NET] CSQ: "); Serial.println(scanner.getSignalStrength());
+  // --- Bring up PDP (get IP) with timed poll ---
+  Serial.println("[NET] Starting PDP bring-up...");
+  t0 = millis();
   while (millis() - t0 < pdpDeadlineMs) {
-    (void)gprs.attachGPRS();         // quick nudge; harmless if already up
+    (void)gprs.attachGPRS();                 // quick nudge; harmless if already up
     IPAddress ip = gprs.getIPAddress();
     Serial.print("[NET] IP poll: "); Serial.println(ip);
     if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
-      delay(750); // small settle
+      delay(750);                             // settle sockets a bit
       Serial.print("[NET] PDP IP: "); Serial.println(ip);
       return true;
     }
     delay(500);
   }
 
-  // One clean refresh, then try again briefly
-  Serial.println("[NET] PDP timed out. Refreshing modem and retrying APN path...");
-  nbAccess.shutdown();
-  delay(1500);
-
-  Serial.println("[NET] NB.begin(PIN+APN) (retry)...");
+  // One clean refresh if PDP didn’t appear
+  Serial.println("[NET] PDP timed out; refreshing modem once...");
+  nbAccess.shutdown(); delay(1500);
   st = nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS);
   Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
-  Serial.print("[NET] CEREG: "); Serial.println(nbAccess.isAccessAlive());
-  Serial.print("[NET] CSQ: ");   Serial.println(scanner.getSignalStrength());
 
+  // Re-check registration briefly
+  t0 = millis();
+  while (millis() - t0 < 10000) {
+    int reg = nbAccess.isAccessAlive();
+    if (reg == 1 || reg == 5) break;
+    if (reg == 3) { Serial.println("[NET] Registration denied after refresh"); return false; }
+    delay(500);
+  }
+
+  // Try PDP again (short window)
   t0 = millis();
   while (millis() - t0 < 15000) {
     (void)gprs.attachGPRS();
@@ -193,9 +274,10 @@ bool nbAttachAPN(uint32_t pdpDeadlineMs) {
     delay(500);
   }
 
-  Serial.println("[NET] PDP attach failed (APN path).");
+  Serial.println("[NET] PDP attach failed after refresh");
   return false;
 }
+
 
 void printMqttErr(int e) {
   Serial.print("[MQTT] connectError="); Serial.println(e);
@@ -321,6 +403,21 @@ bool syncTimeViaNTP_UDP(uint32_t overallMs = 15000) {
           rtc.setTime(hour(), minute(), second());
           rtc.setDate(day(), month(), (year()-2000));
           Serial.print("[NTP] OK epoch "); Serial.println(epoch);
+          #if ENABLE_DEBUG
+            Serial.print("[NTP] UTC: ");
+            Serial.print(year());
+            Serial.print("-");
+            Serial.print(month());
+            Serial.print("-");
+            Serial.print(day());
+            Serial.print(" ");
+            Serial.print(hour());
+            Serial.print(":");
+            Serial.print(minute());
+            Serial.print(":");
+            Serial.println(second());
+          #endif
+
           return true;
         }
       }
@@ -414,6 +511,20 @@ bool syncTimeViaHTTPDate_IP(uint32_t connectMs = 6000) {
   rtc.setTime(hour(), minute(), second());
   rtc.setDate(day(), month(), (year()-2000));
   Serial.print("[HTTP-Date] OK epoch "); Serial.println(epoch);
+  #if ENABLE_DEBUG
+  Serial.print("[HTTP] UTC: ");
+  Serial.print(year());
+  Serial.print("-");
+  Serial.print(month());
+  Serial.print("-");
+  Serial.print(day());
+  Serial.print(" ");
+  Serial.print(hour());
+  Serial.print(":");
+  Serial.print(minute());
+  Serial.print(":");
+  Serial.println(second());
+#endif
   return true;
 }
 
@@ -449,10 +560,11 @@ void setup() {
   
   analogReadResolution(12);
 
+
+
   //Serial Comms
   Serial.begin(115200);
   unsigned long t0 = millis(); while (!Serial && millis()-t0 < 4000) {}
-  Serial.println("\n\n=== BOOT ===");
 
   // RTC Setup
   rtc.begin(); // initialize RTC 24H format
@@ -461,28 +573,31 @@ void setup() {
   rtc.enableAlarm(rtc.MATCH_SS);
   rtc.attachInterrupt(rtcWakeISR);
 
-  // Attach via APN
-  if (!nbAttachAPN(30000)) {
-    Serial.println("[BOOT] PDP attach failed with APN. Stop here.");
-    return;
+Serial.println("3s delay...");
+  delay(3000);
+  
+Serial.println("\n=== BOOT ===");
+if (!nbAttachAPN()) {
+  Serial.println("[BOOT] Attach failed — not proceeding.");
+  return;
+}
+
+setupMqttClient();                       // your working helper
+if (!ensureMqttConnected(TB_HOST, TB_PORT)) {
+  // one short PDP refresh + single retry
+  gprs.detachGPRS(); delay(600);
+  if (nbAttachAPN(20000, 20000)) {
+    (void)ensureMqttConnected(TB_HOST, TB_PORT);
   }
+}
 
-  // After you printed PDP IP and before first publish:
-  setupMqttClient();
+Serial.println("3s delay...");
+  delay(3000);
 
-  if (!ensureMqttConnected(TB_HOST, TB_PORT)) {
-    // Optional: single re-attach then one more try
-    Serial.println("[BOOT] MQTT connect failed; will try once more after PDP refresh...");
-    gprs.detachGPRS(); delay(600);
-    // reuse your working APN attach path here
-    if (nbAttachAPN(20000)) {
-      (void)ensureMqttConnected(TB_HOST, TB_PORT);
-    }
-  }
+timeSyncTick();
+// schedule first time-sync attempt only; do NOT run it now
+//scheduleNextTimeSync(false);
 
-  timeSyncOnce();
-  // plan first attempt soon (uses backoff if it fails)
-  scheduleNextTimeSync(false);
 
   // Give the modem ~1s to flush
   unsigned long t1 = millis();
@@ -500,15 +615,12 @@ void setup() {
 void loop()
 {
 
-  // opportunistic maintenance; won't run if not yet due
-  if (!mqttClient.connected()) {   // <- don't poke sockets when MQTT is up
-    timeSyncTick();
-  }
-
   mqttClient.poll(); // keepalive
 //takeRiverLevelSamples(currentSampleNo);  //RL TEST
 //delay(1000);
+
   if(rtcWakeFlag){  //  RTC Alarm (1min)
+
   sampleTimeandDateFromRTC();
   //sampleTimeandDateFromRTC();
     rtcWakeFlag = false;
@@ -524,8 +636,7 @@ void loop()
     if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
       takeRainSamples(currentSampleNo);
     }
-    // Store/calculate sensor values (SD CARD?)
-//    storeSamples(currentSampleNo);
+
     //See if 10minute period has arrived?
     int modTest = (rtc.getMinutes()+1)%SAMPLING_INTERVAL;  //  Need to add 1 as now sampling just before the minute change on 59secs
     if(modTest == 0){
@@ -566,6 +677,12 @@ void loop()
     calcSamples(currentSampleNo);
     createAndSendJsonMsg(); 
 
+    //SD Card
+    
+    writeSDcard(createSDfilename(), createSDcardPayloadHeader());  //  Write header - NEED TO CHANGE TO EVERY DAY!!!!
+    writeSDcard(createSDfilename(), createSDcardPayload());  //  Write data
+    
+
     // after publish + drain
     if (!mqttClient.connected()) {
       timeSyncTick();
@@ -598,15 +715,6 @@ void loop()
 /****************************************************************/
 //                        FUNCTIONS                             //
 /****************************************************************/
-//  Get sampling time from RTC
-void sampleTimeandDateFromRTC(){
-  sampleSecond = rtc.getSeconds();  
-  sampleMinute = rtc.getMinutes();
-  sampleHour = rtc.getHours();
-  sampleYear = rtc.getYear();
-  sampleMonth = rtc.getMonth();
-  sampleDay = rtc.getDay();
-}
 
 // Sample Function
 
@@ -788,8 +896,63 @@ void createAndSendJsonMsg(){
   flashLED(ok ? 1 : 3, 200);
 #endif
 }
+// Create message to SD save
+String createSDcardPayloadHeader(){
+  String payloadHeader;
 
+    payloadHeader += ("Date"); payloadHeader += (",");
+    payloadHeader += ("Time"); payloadHeader += (",");
+    if (SENSORS_MODE == 0){  //  Both RL and Rain
+      payloadHeader += ("RiverLevel-Current"); payloadHeader += (",");
+      #if ENABLE_MAX_MIN_RL
+        payloadHeader += ("RiverLevel-Max"); payloadHeader += (",");
+        payloadHeader += ("RiverLevel-Min"); payloadHeader += (",");
+      #endif
+      payloadHeader += ("rainInterval"); payloadHeader += (",");
+      payloadHeader += ("rain24hr"); payloadHeader += (",");
+    }
+    else if (SENSORS_MODE == 1){  //  Rainfall Only
+      payloadHeader += ("rainInterval"); payloadHeader += (",");
+      payloadHeader += ("rain24hr"); payloadHeader += (",");
+    }
+    else if (SENSORS_MODE == 2){  // River Level Only
+      payloadHeader += ("RiverLevel-Current"); payloadHeader += (",");
+      #if ENABLE_MAX_MIN_RL
+        payloadHeader += ("RiverLevel-Max"); payloadHeader += (",");
+        payloadHeader += ("RiverLevel-Min"); payloadHeader += (",");
+      #endif    
+    }
+    return payloadHeader;  
+}
 
+// Create message to SD save
+String createSDcardPayload(){
+  String payload;
+
+    payload += (sampleYear+2000); payload += ("-"); payload += (sampleMonth); payload += ("-"); payload += (sampleDay); payload += (",");
+    payload += (sampleHour); payload += (":"); payload += (sampleMinute); payload += (":"); payload += (sampleSecond); payload += (",");
+    if (SENSORS_MODE == 0){  //  Both RL and Rain
+      payload += ("RiverLevel-Current = "); payload += (currentRiverLevel); payload += (","); 
+      #if ENABLE_MAX_MIN_RL
+        payload += ("RiverLevel-Max = "); payload += (riverLevelMax); payload += (",");
+        payload += ("RiverLevel-Min = ");payload += (riverLevelMin); payload += (",");
+      #endif
+      payload += ("rainInterval = "); payload += (rainTipsCounter); payload += (",");
+      payload += ("rain24hr = "); payload += (rain24hrTipsCounter); payload += (",");
+    }
+    else if (SENSORS_MODE == 1){  //  Rainfall Only
+      payload += ("rainInterval = "); payload += (rainTipsCounter); payload += (",");
+      payload += ("rain24hr = "); payload += (rain24hrTipsCounter); payload += (",");
+    }
+    else if (SENSORS_MODE == 2){  // River Level Only
+      payload += ("RiverLevel-Current = "); payload += (currentRiverLevel); payload += (","); 
+      #if ENABLE_MAX_MIN_RL
+        payload += ("RiverLevel-Max = "); payload += (riverLevelMax); payload += (",");
+        payload += ("RiverLevel-Min = ");payload += (riverLevelMin); payload += (",");
+      #endif    
+    }
+    return payload;
+}
 
 
 ///////////////////////////////////////////////////////////

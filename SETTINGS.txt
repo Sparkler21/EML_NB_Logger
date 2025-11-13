@@ -1,0 +1,28 @@
+# Configuration file for EML NB Logger
+
+# Serial Number
+serialNo = 212702
+
+# Device ID
+device_id = HPT01
+
+# APN
+apn = gigsky-02
+apn_user =
+apn_pass =
+pin =
+
+# sensors_mode -  0 = Rain and River Level, 1 = Rain only, 2 = River Level only
+sensors_mode = 0
+
+# rtc_alarm_second - The second the alarm is triggered
+rtc_alarm_second = 58
+
+# sampling_interval - In minutes
+sampling_interval = 10
+
+# riverLevelRange - Max range in cm
+riverLevelRange = 600
+
+# rainGaugeCF - Rain gauge calibration factor
+rainGaugeCF = 0.200

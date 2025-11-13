@@ -54,18 +54,32 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
  ***********************************************************/
 #define ENABLE_DEBUG                       1
 // ===================== User config =====================
-#define DEVICE_ID   "HPT01"
-// Your APN for LTE-M
-#define APN         "gigsky-02"
-#define APN_USER    ""
-#define APN_PASS    ""
-#define PINNUMBER   ""          // SIM PIN if any
 #define VBAT_PIN A6
-#define SENSORS_MODE 0  // 0 = Rain and River Level, 1 = Rain only, 2 = River Level only
-#define RTC_ALARM_SECOND 58  //  The second the alarm is triggered
-#define SAMPLING_INTERVAL 10  // SAMPLING_INTERVAL in minutes
-uint16_t riverLevelRange = 600;  //  Currently Max range in cm
-float rainGaugeCF = 0.200;  //  Rain gauge calibration factor
+//////////////////////////////////////////
+////    Default Configurations  //////////
+////////////////////////////////////////// 
+#define DEFAULT_INT_VALUE     0
+#define DEFAULT_BOOL_VALUE    false
+#define DEFAULT_STRING_VALUE  "default"
+#define DEFAULT_BYTE_VALUE    0x00
+
+// Configuration settings (from SD Card)
+struct parameters {
+String serialNo;
+String device_id;
+String apn;
+String apn_user;
+String apn_pass;
+String pin;
+int sensors_mode;
+int rtc_alarm_second;
+int sampling_interval;
+String riverLevelRange;
+String rainGaugeCF;
+} settings;
+
+float riverLevelRange_float;
+float rainGaugeCF_float;
 
 const int SDchipSelect = 4;
 const int FLASHchipSelect = 5;
@@ -93,6 +107,9 @@ MqttClient mqttClient(nbClient);
 // A UDP instance to let us send and receive packets over UDP
 NBUDP Udp;
 //Adafruit_ADS1115 ads;
+
+File    configFile;
+char    configChar;
 
 // Flags
 bool NTP_updatedFlag = false;
@@ -128,14 +145,14 @@ uint16_t riverLevel = 0;
 float currentRiverLevel = 0;
 float riverLevelTotal = 0;
 float riverLevelMax = 0;
-float riverLevelMin = riverLevelRange;
+float riverLevelMin = 0;
 uint8_t rainInterval = 0;
 uint16_t rain24hr = 0; 
 uint16_t currentSampleNo = 0;
 uint32_t tsSendValue = 0;
 float riverLevelAveSendValue = 0;
 float riverLevelMaxSendValue = 0;    //  This equals the minimum river level in cm.
-float riverLevelMinSendValue = riverLevelRange; //  This equals the maximum river level in cm.
+float riverLevelMinSendValue = 0; //  This equals the maximum river level in cm.
 float rainIntervalSendValue = 0;
 float rain24hrSendValue = 0;
 uint8_t sampleYear;
@@ -149,7 +166,7 @@ uint8_t sampleSecond;
 //  Helper Functions
 ///////////////////////////////////////////////////////////
 void resetAlarms(){
-    rtc.setAlarmSeconds(RTC_ALARM_SECOND);
+    rtc.setAlarmSeconds(settings.rtc_alarm_second);
     rtc.enableAlarm(rtc.MATCH_SS);
 }
 
@@ -227,7 +244,7 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   unsigned long t0 = millis();
   Serial.println("[NET] NB.begin(PIN+APN)...");
   while(st != 3  || (millis() - t0 < beginDeadlineMs)){
-    st = nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS);
+    st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apn_user.c_str(), settings.apn_pass.c_str());
   }
   if(st == 3){
     Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
@@ -281,7 +298,7 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   // One clean refresh if PDP didn’t appear
   Serial.println("[NET] PDP timed out; refreshing modem once...");
   nbAccess.shutdown(); delay(1500);
-  st = nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS);
+  st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apn_user.c_str(), settings.apn_pass.c_str());
   Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
 
   // Re-check registration briefly
@@ -325,7 +342,7 @@ void printMqttErr(int e) {
 
 // --- MQTT helpers ---
 void setupMqttClient() {
-  mqttClient.setId(DEVICE_ID);                 // non-empty clientId (yours)
+  mqttClient.setId(settings.device_id);                 // non-empty clientId (yours)
   mqttClient.setUsernamePassword(TB_TOKEN, ""); // TB token as username, blank password
   mqttClient.setKeepAliveInterval(45 * 1000);   // NB/LTE-M friendly
   mqttClient.beginWill("v1/devices/me/attributes", false, 0);
@@ -599,10 +616,24 @@ void setup() {
   Serial.begin(115200);
   unsigned long t0 = millis(); while (!Serial && millis()-t0 < 4000) {}
 
+  if(getSettings())  //  Read SlingShot Configs
+  {
+    Serial.println("Get Settings - Success");
+    serialPrintSettings();  //  Print configs to screen
+  }
+  else
+  {
+    Serial.println("Get Settings - Failed");
+  }
+
+  //Intialise limits from uploaded settings
+  riverLevelMin = riverLevelRange_float;
+  riverLevelMinSendValue = riverLevelRange_float;
+
   // RTC Setup
   rtc.begin(); // initialize RTC 24H format
   rtc.setAlarmSeconds(0);
-  rtc.setAlarmSeconds(RTC_ALARM_SECOND);
+  rtc.setAlarmSeconds(settings.rtc_alarm_second);
   rtc.enableAlarm(rtc.MATCH_SS);
   rtc.attachInterrupt(rtcWakeISR);
 
@@ -663,15 +694,15 @@ void loop()
     //Read the LiPo battery volts level
     readBatteryVoltage();
     // Sample Sensors
-    if(SENSORS_MODE == 0 || SENSORS_MODE == 2){  //River Level
+    if(settings.sensors_mode == 0 || settings.sensors_mode == 2){  //River Level
       takeRiverLevelSamples(currentSampleNo);
     }
-    if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
+    if(settings.sensors_mode == 0 || settings.sensors_mode == 1){  //Rain
       takeRainSamples(currentSampleNo);
     }
 
     //See if 10minute period has arrived?
-    int modTest = (rtc.getMinutes()+1)%SAMPLING_INTERVAL;  //  Need to add 1 as now sampling just before the minute change on 59secs
+    int modTest = (rtc.getMinutes()+1)%settings.sampling_interval;  //  Need to add 1 as now sampling just before the minute change on 59secs
     if(modTest == 0){
       sendMsgFlag = true;
       #if ENABLE_DEBUG
@@ -685,7 +716,7 @@ void loop()
     goToSleepFlag = true;
   }
 
-  if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
+  if(settings.sensors_mode == 0 || settings.sensors_mode == 1){  //Rain
     if(rainWakeFlag){  // Rain Sensor Alarm
       rainWakeFlag = false;
 
@@ -821,20 +852,20 @@ void takeRainSamples(uint16_t no_of_samples) {
 // Process Sensors Function (inc Rain Reset if day change?)
 void calcSamples(uint16_t no_of_samples){
 Serial.println("calcSamples");
-  if(SENSORS_MODE == 0 || SENSORS_MODE == 2){  //River Level
+  if(settings.sensors_mode == 0 || settings.sensors_mode == 2){  //River Level
     riverLevelAveSendValue = riverLevelTotal/no_of_samples;  //  Calculate the average river level during the sampling period
     #if ENABLE_MAX_MIN_RL
       riverLevelMaxSendValue = riverLevelMax;
       riverLevelMinSendValue = riverLevelMin;
       riverLevelMax = 0;
-      riverLevelMin = riverLevelRange;
+      riverLevelMin = riverLevelRange_float;
     #endif
     riverLevelTotal = 0;
   }
 
-  if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
-    rainIntervalSendValue = rainTipsCounter * rainGaugeCF;
-    rain24hrSendValue = rain24hrTipsCounter * rainGaugeCF;
+  if(settings.sensors_mode == 0 || settings.sensors_mode == 1){  //Rain
+    rainIntervalSendValue = rainTipsCounter * rainGaugeCF_float;
+    rain24hrSendValue = rain24hrTipsCounter * rainGaugeCF_float;
     rainTipsCounter = 0;
   }
   currentSampleNo = 0;
@@ -848,10 +879,10 @@ void createAndSendJsonMsg(){
   if (!useServerTimestamp) {
     // use device timestamp (array with ts + values)
     uint32_t ts = rtc.getEpoch();     // seconds since 1970
-    if (SENSORS_MODE == 0) {
+    if (settings.sensors_mode == 0) {
       payload += "[{\"ts\":"; payload += ts; payload += "000";
       payload += ",\"values\":{";
-      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
       payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
       payload += "\"rlAve\":";   payload += riverLevelAveSendValue;    payload += ",";
       #if ENABLE_MAX_MIN_RL
@@ -861,17 +892,17 @@ void createAndSendJsonMsg(){
       payload += "\"rainInt\":"; payload += rainIntervalSendValue;     payload += ",";
       payload += "\"rain24hr\":";payload += rain24hrSendValue;
       payload += "}}]";
-    } else if (SENSORS_MODE == 1) {
+    } else if (settings.sensors_mode == 1) {
       payload += "[{\"ts\":"; payload += ts; payload += "000";
       payload += ",\"values\":{";
-      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
       payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
       payload += "\"rain24hr\":"; payload += rain24hrSendValue;
       payload += "}}]";
     } else { // 2
       payload += "[{\"ts\":"; payload += ts; payload += "000";
       payload += ",\"values\":{";
-      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
       payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; 
       #if ENABLE_MAX_MIN_RL
       payload += ",";
@@ -882,9 +913,9 @@ void createAndSendJsonMsg(){
     }
   } else {
     // server timestamp: plain object (no ts, no "values" wrapper)
-    if (SENSORS_MODE == 0) {
+    if (settings.sensors_mode == 0) {
       payload += "{";
-      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
       payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
       payload += "\"rlAve\":";   payload += riverLevelAveSendValue;    payload += ",";
       #if ENABLE_MAX_MIN_RL
@@ -894,15 +925,15 @@ void createAndSendJsonMsg(){
       payload += "\"rainInt\":"; payload += rainIntervalSendValue;     payload += ",";
       payload += "\"rain24hr\":";payload += rain24hrSendValue;
       payload += "}";
-    } else if (SENSORS_MODE == 1) {
+    } else if (settings.sensors_mode == 1) {
       payload += "{";
-      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
       payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
       payload += "\"rain24hr\":"; payload += rain24hrSendValue;
       payload += "}";
     } else {
       payload += "{";
-      payload += "\"device\":\""; payload += DEVICE_ID; payload += "\",";
+      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
       payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; 
       #if ENABLE_MAX_MIN_RL
       payload += ",";
@@ -930,7 +961,7 @@ String createSDcardPayloadHeader(){
     payloadHeader += ("Time"); payloadHeader += (",");
     payloadHeader += ("Device"); payloadHeader += (",");
     payloadHeader += ("BatteryVolts"); payloadHeader += (",");
-    if (SENSORS_MODE == 0){  //  Both RL and Rain
+    if (settings.sensors_mode == 0){  //  Both RL and Rain
       payloadHeader += ("RiverLevel-Ave"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
         payloadHeader += ("RiverLevel-Max"); payloadHeader += (",");
@@ -939,11 +970,11 @@ String createSDcardPayloadHeader(){
       payloadHeader += ("rainInterval"); payloadHeader += (",");
       payloadHeader += ("rain24hr"); payloadHeader += (",");
     }
-    else if (SENSORS_MODE == 1){  //  Rainfall Only
+    else if (settings.sensors_mode == 1){  //  Rainfall Only
       payloadHeader += ("rainInterval"); payloadHeader += (",");
       payloadHeader += ("rain24hr"); payloadHeader += (",");
     }
-    else if (SENSORS_MODE == 2){  // River Level Only
+    else if (settings.sensors_mode == 2){  // River Level Only
       payloadHeader += ("RiverLevel-Current"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
         payloadHeader += ("RiverLevel-Max"); payloadHeader += (",");
@@ -956,7 +987,7 @@ String createSDcardPayloadHeader(){
     payloadHeader += ("hh:mm:ss"); payloadHeader += (",");
     payloadHeader += ("Name"); payloadHeader += (",");
     payloadHeader += ("V"); payloadHeader += (",");
-    if (SENSORS_MODE == 0){  //  Both RL and Rain
+    if (settings.sensors_mode == 0){  //  Both RL and Rain
       payloadHeader += ("cm"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
         payloadHeader += ("cm"); payloadHeader += (",");
@@ -965,11 +996,11 @@ String createSDcardPayloadHeader(){
       payloadHeader += ("mm"); payloadHeader += (",");
       payloadHeader += ("mm"); payloadHeader += (",");
     }
-    else if (SENSORS_MODE == 1){  //  Rainfall Only
+    else if (settings.sensors_mode == 1){  //  Rainfall Only
       payloadHeader += ("mm"); payloadHeader += (",");
       payloadHeader += ("mm"); payloadHeader += (",");
     }
-    else if (SENSORS_MODE == 2){  // River Level Only
+    else if (settings.sensors_mode == 2){  // River Level Only
       payloadHeader += ("cm"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
         payloadHeader += ("cm"); payloadHeader += (",");
@@ -986,9 +1017,9 @@ String createSDcardPayload(){
 
     payload += (sampleYear+2000); payload += ("-"); payload += (sampleMonth); payload += ("-"); payload += (sampleDay); payload += (",");
     payload += (sampleHour); payload += (":"); payload += (sampleMinute); payload += (":"); payload += (sampleSecond); payload += (",");
-    payload += (DEVICE_ID); payload += (",");
+    payload += (settings.device_id); payload += (",");
     payload += (batteryVolts); payload += (",");
-    if (SENSORS_MODE == 0){  //  Both RL and Rain
+    if (settings.sensors_mode == 0){  //  Both RL and Rain
       payload += (riverLevelAveSendValue); payload += (","); 
       #if ENABLE_MAX_MIN_RL
         payload += (riverLevelMaxSendValue); payload += (",");
@@ -997,11 +1028,11 @@ String createSDcardPayload(){
       payload += (rainIntervalSendValue); payload += (",");
       payload += (rain24hrSendValue); payload += (",");
     }
-    else if (SENSORS_MODE == 1){  //  Rainfall Only
+    else if (settings.sensors_mode == 1){  //  Rainfall Only
       payload += (rainIntervalSendValue); payload += (",");
       payload += (rain24hrSendValue); payload += (",");
     }
-    else if (SENSORS_MODE == 2){  // River Level Only
+    else if (settings.sensors_mode == 2){  // River Level Only
       payload += (riverLevelAveSendValue); payload += (","); 
       #if ENABLE_MAX_MIN_RL
         payload += (riverLevelMaxSendValue); payload += (",");
@@ -1095,6 +1126,243 @@ unsigned long sendNTPpacket(IPAddress& address)
   //Serial.println("6");
 }
 
+////////////////////////////////////////
+//  Get the Configs from the SD Card  //
+////////////////////////////////////////
+boolean getSettings()
+{
+ // Open the settings file for reading:
+  String  description = "";
+
+  Serial.print("Reading SD card...");
+
+  // see if the card is present and can be initialized:
+  if (!SD.begin(SDchipSelect)) {
+    Serial.println("Card failed, or not present");
+    // don't do anything more:
+    while (1);
+  }
+  Serial.println("card initialized.");
+
+  configFile = SD.open("SETTINGS.TXT");
+  if (!configFile) {
+    return false;
+  }
+
+  // read from the file until there's nothing else in it:
+  while (configFile.available()) 
+  {
+    configChar = configFile.read();
+
+    if (configChar == '#')           
+    { // Comment - ignore this line
+      skipLine();
+
+    } 
+    else if (isalnum(configChar))  
+    { // Add a configChar to the description
+      description.concat(configChar);
+    } 
+    else if (configChar =='=')     
+    { // start checking the value for possible results
+
+      // First going to trim out all trailing white spaces
+      do 
+      {
+        configChar = configFile.read();
+      } 
+      while(configChar == ' ');
+
+      // Property list
+      if (description == "serialNo") 
+      {
+        settings.serialNo = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.serialNo.trim();
+      }
+      else if (description == "device_id") 
+      {
+        settings.device_id = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.device_id.trim();
+      }
+      else if (description == "apn") 
+      {
+        settings.apn = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.apn.trim();
+      }
+      else if (description == "apn_user") 
+      {
+        settings.apn_user = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.apn_user.trim();
+      }
+      else if (description == "apn_pass") 
+      {
+        settings.apn_pass = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.apn_pass.trim();
+      }
+      else if (description == "pin") 
+      {
+        settings.pin = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.pin.trim();
+      }
+      else if (description == "sensors_mode") 
+      {
+        settings.sensors_mode = getIntSetting(DEFAULT_INT_VALUE);
+      }
+      else if (description == "rtc_alarm_second") 
+      {
+        settings.rtc_alarm_second = getIntSetting(DEFAULT_INT_VALUE);
+      } 
+      else if (description == "sampling_interval") 
+      {
+        settings.sampling_interval = getIntSetting(DEFAULT_INT_VALUE);
+      } 
+      else if (description == "riverLevelRange") 
+      {
+        settings.riverLevelRange = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.riverLevelRange.trim();
+      }
+      else if (description == "rainGaugeCF") 
+      {
+        settings.rainGaugeCF = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.rainGaugeCF.trim();
+      }
+      else 
+      { // Unknown parameter - ignore this line
+        skipLine();
+      }
+      description = "";
+    } 
+    else 
+    {
+      // Ignore this configChar (could be space, tab, newline, carriage return or something else)
+    }
+  }
+  // close the file:
+  configFile.close();
+
+  riverLevelRange_float = settings.riverLevelRange.toFloat();   //  Convert from Strings to Floats
+  rainGaugeCF_float = settings.rainGaugeCF.toFloat();
+
+  return true;
+}
+
+////////////////////////////////////////////
+//  Skipline - Part of Configs functions  //
+////////////////////////////////////////////
+void skipLine()
+{
+  do 
+  {
+    configChar = configFile.read();
+  } 
+  while (configChar != '\n');
+}
+////////////////////////////////////////////////////
+//  Get Int Settings - Part of Configs functions  //
+////////////////////////////////////////////////////
+int getIntSetting(int defaultValue)
+{
+  String  value = "";
+  boolean valid = true;
+
+  while (configChar != '\n') 
+  {
+    if (isdigit(configChar) || configChar == '-') 
+    {
+      value.concat(configChar);
+    } 
+//    else if (configChar != '\n') 
+//    { // Use of invalid values
+//      valid = false;
+//    }
+    configChar = configFile.read();            
+  }
+  
+  if (valid) { 
+    // Convert string to integer
+    char charBuf[value.length()+1];
+    value.toCharArray(charBuf,value.length()+1);
+    return atoi(charBuf);
+  } else {
+    // revert to default value for invalid entry in settings
+    return defaultValue;
+  }
+}
+/////////////////////////////////////////////////////
+//  Get Bool Settings - Part of Configs functions  //
+/////////////////////////////////////////////////////
+bool getBoolSetting(bool defaultValue)
+{
+  if (configChar == '1') 
+  {
+    return true;
+  } 
+  else if (configChar == '0') 
+  {
+    return false;
+  } 
+  else 
+  {
+    return defaultValue;
+  }
+}
+///////////////////////////////////////////////////////
+//  Get String Settings - Part of Configs functions  //
+///////////////////////////////////////////////////////
+String getStringSetting(String defaultValue)
+{
+  String value = "";
+  do 
+  {
+    value.concat(configChar);
+    configChar = configFile.read();
+  } 
+  while(configChar != '\n');
+  
+  if (value != "") 
+  {
+    return value;
+  } 
+  else 
+  {
+    return defaultValue;
+  }
+
+}
+
+//////////////////////////////////////
+//  Print locally the Configs       //
+//////////////////////////////////////
+void serialPrintSettings()
+{
+  Serial.println(F("-------------------------------------------------"));
+  Serial.println(F("Loading configuration settings from SD Card......"));
+  Serial.println(F("-------------------------------------------------"));
+  Serial.print(F("serialNo: "));
+  Serial.println(settings.serialNo);
+  Serial.print(F("device_id: "));
+  Serial.println(settings.device_id);
+  Serial.print(F("apn: "));
+  Serial.println(settings.apn);  
+  Serial.print(F("apn_user: "));
+  Serial.println(settings.apn_user);  
+  Serial.print(F("apn_pass: "));
+  Serial.println(settings.apn_pass);  
+  Serial.print(F("pin: "));
+  Serial.println(settings.pin);  
+  Serial.print(F("sensors_mode: "));
+  Serial.println(settings.sensors_mode);  
+  Serial.print(F("rtc_alarm_second: "));
+  Serial.println(settings.rtc_alarm_second);  
+  Serial.print(F("sampling_interval(min): "));
+  Serial.println(settings.sampling_interval);  
+  Serial.print(F("riverLevelRange: "));
+  Serial.println(settings.riverLevelRange);  
+  Serial.print(F("rainGaugeCF: "));
+  Serial.println(settings.rainGaugeCF);  
+  Serial.println(F("-------------------------------------------------"));
+}
+
 void flashLED(uint8_t no_of_flashes, uint16_t delay_time)
 {
   for (int i = 0; i < no_of_flashes; i++){
@@ -1114,7 +1382,7 @@ void rtcWakeISR()
 // Rain Interrupt function
 // ISR for rain tips (debounced)
 void rainWakeISR() {
-  if(SENSORS_MODE == 0 || SENSORS_MODE == 1){  //Rain
+  if(settings.sensors_mode == 0 || settings.sensors_mode == 1){  //Rain
     uint32_t t = micros();
     rainWakeFlag = true;
     if (t - lastPulseUs > 10000) { // ~10 ms debounce

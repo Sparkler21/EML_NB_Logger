@@ -54,7 +54,7 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
  ***********************************************************/
 #define ENABLE_DEBUG                       1
 // ===================== User config =====================
-#define DEVICE_ID   "EML_HPT_001"
+#define DEVICE_ID   "HPT01"
 // Your APN for LTE-M
 #define APN         "gigsky-02"
 #define APN_USER    ""
@@ -69,6 +69,7 @@ float rainGaugeCF = 0.200;  //  Rain gauge calibration factor
 
 const int SDchipSelect = 4;
 const int FLASHchipSelect = 5;
+const String logFile = "log.txt";
 
 // ---- ThingsBoard EU MQTT ----
 const char TB_HOST[]   = "mqtt.eu.thingsboard.cloud"; // EU cluster
@@ -99,7 +100,9 @@ volatile bool rtcWakeFlag = false;
 volatile bool rainWakeFlag = false;
 bool sendMsgFlag = false;
 bool goToSleepFlag = false;
-
+bool nbAttachAPN_Flag = false;
+bool mqttConnectFlag = false;
+bool ntpUpdateFlag = false;
 
 // --- Time sync state ---
 bool useServerTimestamp = true;                 // start with TB server time until we sync
@@ -114,6 +117,9 @@ const int PIN_RL_EN = 6;  // River Level Enable
 volatile uint32_t rainTipsCounter = 0;
 volatile uint32_t rain24hrTipsCounter = 0;
 volatile uint32_t lastPulseUs = 0;
+
+String previousSDfilename = "";
+String currentSDfilename = "";
 
 // minute samples
 float batteryVolts = 0;
@@ -160,7 +166,6 @@ void sampleTimeandDateFromRTC(){
 String createSDfilename(){
 
   String SDfilename = "";
-  sampleTimeandDateFromRTC();
   SDfilename += sampleYear; SDfilename += sampleMonth; SDfilename += sampleDay; SDfilename += ".csv";
   Serial.print("SDfilename: ");
   Serial.println(SDfilename);
@@ -197,15 +202,43 @@ void writeSDcard(String SDfilename, String dataString){
   delay(1000);
 
 }
+void writeSDcardLog(String dataString){
+  String dataStringLog = "";
+
+  dataStringLog += rtc.getDay();
+  dataStringLog += "-";
+  dataStringLog += rtc.getMonth();
+  dataStringLog += "-";
+  dataStringLog += rtc.getYear();  
+  dataStringLog += " ";
+  dataStringLog += rtc.getHours();
+  dataStringLog += ":";
+  dataStringLog += rtc.getMinutes();
+  dataStringLog += ":";
+  dataStringLog += rtc.getSeconds();  
+  dataStringLog += dataString;
+  dataStringLog += "\n"; 
+  writeSDcard(logFile, dataStringLog);
+}
 
 // Registration-first attach: wait for CEREG=1/5 before touching PDP
-bool nbAttachAPN(uint32_t regDeadlineMs = 45000, uint32_t pdpDeadlineMs = 30000) {
+bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000, uint32_t pdpDeadlineMs = 30000) {
+  int st = 0;
+  unsigned long t0 = millis();
   Serial.println("[NET] NB.begin(PIN+APN)...");
-  int st = nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS);
-  Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
+  while(st != 3  || (millis() - t0 < beginDeadlineMs)){
+    st = nbAccess.begin(PINNUMBER, APN, APN_USER, APN_PASS);
+  }
+  if(st == 3){
+    Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
+  }
+  else{
+    Serial.print("[NET] NB.begin(APN) FAIL -> "); Serial.println(st);
+    return false;
+  }
 
   // --- Wait for network registration (CEREG 1=home, 5=roaming) ---
-  unsigned long t0 = millis();
+  t0 = millis();
   int lastReg = -1;
   while (millis() - t0 < regDeadlineMs) {
     int reg = nbAccess.isAccessAlive();   // 0 not, 1 home, 2 searching, 3 denied, 4 unknown, 5 roaming
@@ -573,31 +606,33 @@ void setup() {
   rtc.enableAlarm(rtc.MATCH_SS);
   rtc.attachInterrupt(rtcWakeISR);
 
-Serial.println("3s delay...");
-  delay(3000);
-  
-Serial.println("\n=== BOOT ===");
-if (!nbAttachAPN()) {
-  Serial.println("[BOOT] Attach failed — not proceeding.");
-  return;
-}
+  Serial.println("\n=== BOOT ===");
+  nbAttachAPN_Flag = nbAttachAPN();
+  if (!nbAttachAPN_Flag) {
+    Serial.println("[BOOT] Attach failed — not proceeding.");
+    writeSDcardLog("[BOOT] Attach failed — not proceeding");
+    return;
+  }
 
 setupMqttClient();                       // your working helper
-if (!ensureMqttConnected(TB_HOST, TB_PORT)) {
+mqttConnectFlag = ensureMqttConnected(TB_HOST, TB_PORT);
+if (!mqttConnectFlag) {
   // one short PDP refresh + single retry
   gprs.detachGPRS(); delay(600);
-  if (nbAttachAPN(20000, 20000)) {
-    (void)ensureMqttConnected(TB_HOST, TB_PORT);
+  if (nbAttachAPN(20000, 20000, 20000)) {
+    mqttConnectFlag = ensureMqttConnected(TB_HOST, TB_PORT);
+  }
+  if(!mqttConnectFlag){
+    Serial.println("[MQQT] Connection failed — not proceeding.");
+    writeSDcardLog("[MQQT] Connection failed — not proceeding.");
   }
 }
 
-Serial.println("3s delay...");
-  delay(3000);
+  ntpUpdateFlag = timeSyncOnce();
 
-timeSyncTick();
-// schedule first time-sync attempt only; do NOT run it now
-//scheduleNextTimeSync(false);
-
+  if(ntpUpdateFlag == false){
+    writeSDcardLog("[NTP] NTP Clock Update Failed");
+  }
 
   // Give the modem ~1s to flush
   unsigned long t1 = millis();
@@ -605,8 +640,6 @@ timeSyncTick();
   Serial.println("[DONE] Connect.");
 
 }
-
-
 
 
 ///////////////////////////////////////////////////////////
@@ -667,7 +700,7 @@ void loop()
   }
 
   if(sendMsgFlag){  //  Send Message
-    tsSendValue = rtc.getEpoch();  //  Minus 1sec for 1sec consistant delay
+    tsSendValue = rtc.getEpoch();  //  Time for JsonMsg
     sendMsgFlag = false;  //clear flag
     #if ENABLE_DEBUG
       Serial.println("sendMessage!");
@@ -678,10 +711,12 @@ void loop()
     createAndSendJsonMsg(); 
 
     //SD Card
-    
-    writeSDcard(createSDfilename(), createSDcardPayloadHeader());  //  Write header - NEED TO CHANGE TO EVERY DAY!!!!
-    writeSDcard(createSDfilename(), createSDcardPayload());  //  Write data
-    
+    currentSDfilename = createSDfilename();
+    if (currentSDfilename != previousSDfilename){  //New file so new header needed
+      writeSDcard(currentSDfilename, createSDcardPayloadHeader());  //  Write new header on new file
+      previousSDfilename = currentSDfilename;  //  Update previous filename so we can move on...
+    }
+    writeSDcard(currentSDfilename, createSDcardPayload());  //  Write data
 
     // after publish + drain
     if (!mqttClient.connected()) {
@@ -759,13 +794,12 @@ void takeRiverLevelSamples(uint16_t no_of_samples) {
 
   #if ENABLE_DEBUG
     Serial.print(sampleYear+2000); Serial.print("-"); Serial.print(sampleMonth); Serial.print("-"); Serial.print(sampleDay);
-    Serial.print(" ");
+    Serial.print(", ");
     Serial.print(sampleHour); Serial.print(":"); Serial.print(sampleMinute); Serial.print(":"); Serial.print(sampleSecond); Serial.print(", ");
     Serial.print("Sample No = "); Serial.print(no_of_samples); Serial.print(", ");
     Serial.print("RiverLevel-Current = "); Serial.print(currentRiverLevel); Serial.print(", ");
-    Serial.print("RiverLevel-Total = "); Serial.print(riverLevelTotal); 
+    Serial.print("RiverLevel-Total = "); Serial.print(riverLevelTotal); Serial.print(", ");
     #if ENABLE_MAX_MIN_RL
-      Serial.print(", ");
       Serial.print("RiverLevel-Max = "); Serial.print(riverLevelMax); Serial.print(", ");
       Serial.print("RiverLevel-Min = "); Serial.println(riverLevelMin);
     #endif
@@ -775,8 +809,8 @@ void takeRiverLevelSamples(uint16_t no_of_samples) {
 void takeRainSamples(uint16_t no_of_samples) {
 
   #if ENABLE_DEBUG
-    Serial.println(sampleYear+2000); Serial.print("-"); Serial.print(sampleMonth); Serial.print("-"); Serial.print(sampleDay);
-    Serial.print(" ");
+    Serial.print(sampleYear+2000); Serial.print("-"); Serial.print(sampleMonth); Serial.print("-"); Serial.print(sampleDay);
+    Serial.print(", ");
     Serial.print(sampleHour); Serial.print(":"); Serial.print(sampleMinute); Serial.print(":"); Serial.print(sampleSecond); Serial.print(", ");
     Serial.print("Sample No = "); Serial.print(no_of_samples); Serial.print(", ");
     Serial.print("rainInterval = "); Serial.print(rainTipsCounter); Serial.print(", ");
@@ -804,14 +838,6 @@ Serial.println("calcSamples");
     rainTipsCounter = 0;
   }
   currentSampleNo = 0;
-}
-// Store Samples Data Function (SD Card)
-void storeSamples(uint16_t no_of_samples){
-    //samples[no_of_samples].sampleNo);
-    //samples[no_of_samples].ts);
-    //samples[no_of_samples].riverLevel);
-    //samples[no_of_samples].rainInterval);
-    //samples[no_of_samples].rain24hr);
 }
 
 // Create Json message to send
@@ -899,11 +925,13 @@ void createAndSendJsonMsg(){
 // Create message to SD save
 String createSDcardPayloadHeader(){
   String payloadHeader;
-
+    //Headers
     payloadHeader += ("Date"); payloadHeader += (",");
     payloadHeader += ("Time"); payloadHeader += (",");
+    payloadHeader += ("Device"); payloadHeader += (",");
+    payloadHeader += ("BatteryVolts"); payloadHeader += (",");
     if (SENSORS_MODE == 0){  //  Both RL and Rain
-      payloadHeader += ("RiverLevel-Current"); payloadHeader += (",");
+      payloadHeader += ("RiverLevel-Ave"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
         payloadHeader += ("RiverLevel-Max"); payloadHeader += (",");
         payloadHeader += ("RiverLevel-Min"); payloadHeader += (",");
@@ -922,6 +950,33 @@ String createSDcardPayloadHeader(){
         payloadHeader += ("RiverLevel-Min"); payloadHeader += (",");
       #endif    
     }
+    payloadHeader += ("\n");
+    //Units
+    payloadHeader += ("DD/MM/YY"); payloadHeader += (",");
+    payloadHeader += ("hh:mm:ss"); payloadHeader += (",");
+    payloadHeader += ("Name"); payloadHeader += (",");
+    payloadHeader += ("V"); payloadHeader += (",");
+    if (SENSORS_MODE == 0){  //  Both RL and Rain
+      payloadHeader += ("cm"); payloadHeader += (",");
+      #if ENABLE_MAX_MIN_RL
+        payloadHeader += ("cm"); payloadHeader += (",");
+        payloadHeader += ("cm"); payloadHeader += (",");
+      #endif
+      payloadHeader += ("mm"); payloadHeader += (",");
+      payloadHeader += ("mm"); payloadHeader += (",");
+    }
+    else if (SENSORS_MODE == 1){  //  Rainfall Only
+      payloadHeader += ("mm"); payloadHeader += (",");
+      payloadHeader += ("mm"); payloadHeader += (",");
+    }
+    else if (SENSORS_MODE == 2){  // River Level Only
+      payloadHeader += ("cm"); payloadHeader += (",");
+      #if ENABLE_MAX_MIN_RL
+        payloadHeader += ("cm"); payloadHeader += (",");
+        payloadHeader += ("cm"); payloadHeader += (",");
+      #endif    
+    }
+
     return payloadHeader;  
 }
 
@@ -931,24 +986,26 @@ String createSDcardPayload(){
 
     payload += (sampleYear+2000); payload += ("-"); payload += (sampleMonth); payload += ("-"); payload += (sampleDay); payload += (",");
     payload += (sampleHour); payload += (":"); payload += (sampleMinute); payload += (":"); payload += (sampleSecond); payload += (",");
+    payload += (DEVICE_ID); payload += (",");
+    payload += (batteryVolts); payload += (",");
     if (SENSORS_MODE == 0){  //  Both RL and Rain
-      payload += ("RiverLevel-Current = "); payload += (currentRiverLevel); payload += (","); 
+      payload += (riverLevelAveSendValue); payload += (","); 
       #if ENABLE_MAX_MIN_RL
-        payload += ("RiverLevel-Max = "); payload += (riverLevelMax); payload += (",");
-        payload += ("RiverLevel-Min = ");payload += (riverLevelMin); payload += (",");
+        payload += (riverLevelMaxSendValue); payload += (",");
+        payload += (riverLevelMinSendValue); payload += (",");
       #endif
-      payload += ("rainInterval = "); payload += (rainTipsCounter); payload += (",");
-      payload += ("rain24hr = "); payload += (rain24hrTipsCounter); payload += (",");
+      payload += (rainIntervalSendValue); payload += (",");
+      payload += (rain24hrSendValue); payload += (",");
     }
     else if (SENSORS_MODE == 1){  //  Rainfall Only
-      payload += ("rainInterval = "); payload += (rainTipsCounter); payload += (",");
-      payload += ("rain24hr = "); payload += (rain24hrTipsCounter); payload += (",");
+      payload += (rainIntervalSendValue); payload += (",");
+      payload += (rain24hrSendValue); payload += (",");
     }
     else if (SENSORS_MODE == 2){  // River Level Only
-      payload += ("RiverLevel-Current = "); payload += (currentRiverLevel); payload += (","); 
+      payload += (riverLevelAveSendValue); payload += (","); 
       #if ENABLE_MAX_MIN_RL
-        payload += ("RiverLevel-Max = "); payload += (riverLevelMax); payload += (",");
-        payload += ("RiverLevel-Min = ");payload += (riverLevelMin); payload += (",");
+        payload += (riverLevelMaxSendValue); payload += (",");
+        payload += (riverLevelMinSendValue); payload += (",");
       #endif    
     }
     return payload;

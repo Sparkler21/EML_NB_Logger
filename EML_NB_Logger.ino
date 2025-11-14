@@ -48,6 +48,7 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 #include <ArduinoMqttClient.h>
 #include <SPI.h>
 #include <SD.h>
+#include <Adafruit_SleepyDog.h>
 /************************************************************
  * Enables debug support. To disable this feature set to 0.
  ***********************************************************/
@@ -99,6 +100,10 @@ IPAddress timeServer(129, 6, 15, 28); // time.nist.gov NTP server
 const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
 byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
 unsigned int localPort = 2390;      // local port to listen for UDP packets
+// --- Watchdog + network recovery state ---
+const int WDT_TIMEOUT_MS = 16000;          // ~16 s (max on SAMD21)
+uint8_t netRecoverFailures = 0;
+const uint8_t NET_RECOVER_REBOOT_LIMIT = 3;
 // Flags
 bool NTP_updatedFlag = false;
 volatile bool rtcWakeFlag = false;
@@ -144,6 +149,9 @@ uint8_t sampleDay;
 uint8_t sampleHour;
 uint8_t sampleMinute;
 uint8_t sampleSecond;  
+
+void forceReboot(const char* reason);
+bool recoverNetworkAndMqtt();
 
 ///////////////////////////////////////////////////////////
 //  Helper Functions
@@ -216,14 +224,23 @@ void writeSDcardLog(String dataString){
   dataStringLog += rtc.getSeconds();
   dataStringLog += " ";
   dataStringLog += dataString;
-  dataStringLog += "\n"; 
+//  dataStringLog += "\n"; 
   writeSDcard(logFile, dataStringLog);
+}
+
+void forceReboot(const char* reason) {
+  Serial.print("[REBOOT] ");
+  Serial.println(reason);
+  writeSDcardLog(String("[REBOOT] ") + reason);
+  delay(200);  // let serial/SD flush
+  NVIC_SystemReset();  // SAMD21 full reset
 }
 
 bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000, uint32_t pdpDeadlineMs = 30000) {
   int st = 0;
   unsigned long t0 = millis();
   Serial.println("[NET] NB.begin(PIN+APN)...");
+  Watchdog.enable(WDT_TIMEOUT_MS);
   while(st != 3  || (millis() - t0 < beginDeadlineMs)){
     st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apnUser.c_str(), settings.apnPass.c_str());
   }
@@ -250,6 +267,7 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
       return false;
     }
     delay(500);
+    Watchdog.reset();
   }
   if (!(lastReg == 1 || lastReg == 5)) {
     Serial.println("[NET] Registration timeout — no network attach");
@@ -264,6 +282,7 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   // --- Bring up PDP (get IP) with timed poll ---
   Serial.println("[NET] Starting PDP bring-up...");
   t0 = millis();
+  Watchdog.reset();
   while (millis() - t0 < pdpDeadlineMs) {
     (void)gprs.attachGPRS();                 // quick nudge; harmless if already up
     IPAddress ip = gprs.getIPAddress();
@@ -273,6 +292,7 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
       Serial.print("[NET] PDP IP: "); Serial.println(ip);
       return true;
     }
+    Watchdog.disable();
     delay(500);
   }
   // One clean refresh if PDP didn’t appear
@@ -307,6 +327,37 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   Serial.println("[NET] PDP attach failed after refresh");
   return false;
 }
+
+bool recoverNetworkAndMqtt() {
+  Serial.println(F("[NET] Recovery: NB + MQTT"));
+
+  gprs.detachGPRS();
+  delay(600);
+
+  if (!nbAttachAPN(20000, 20000, 20000)) {
+    Serial.println(F("[NET] nbAttachAPN() failed in recovery"));
+    netRecoverFailures++;
+    if (netRecoverFailures >= NET_RECOVER_REBOOT_LIMIT) {
+      forceReboot("[NET] nbAttachAPN() failed repeatedly");
+    }
+    return false;
+  }
+
+  if (!ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt)) {
+    Serial.println(F("[NET] MQTT connect failed in recovery"));
+    netRecoverFailures++;
+    if (netRecoverFailures >= NET_RECOVER_REBOOT_LIMIT) {
+      forceReboot("[NET] MQTT connect failed repeatedly");
+    }
+    return false;
+  }
+
+  // Success – clear error counter
+  netRecoverFailures = 0;
+  Serial.println(F("[NET] Recovery successful"));
+  return true;
+}
+
 
 void printMqttErr(int e) {
   Serial.print("[MQTT] connectError="); Serial.println(e);
@@ -343,18 +394,48 @@ bool ensureMqttConnected(const char* host, int port) {
 
 // Publish JSON and give the modem time to flush
 bool publishTelemetryJSON(const char* topic, const String& json) {
-  if (!ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt)) return false;
-  if (!mqttClient.beginMessage(topic)) {
-    Serial.println("[PUB] beginMessage() failed");
-    return false;
+  // Make sure MQTT is up – try once, and if that fails, run full recovery
+  if (!ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt)) {
+    Serial.println(F("[PUB] MQTT not connected, attempting recovery..."));
+    if (!recoverNetworkAndMqtt()) {
+      Serial.println(F("[PUB] Recovery failed; aborting publish"));
+      return false;
+    }
   }
+
+  if (!mqttClient.beginMessage(topic)) {
+    Serial.println(F("[PUB] beginMessage() failed, trying recovery..."));
+    if (!recoverNetworkAndMqtt()) {
+      Serial.println(F("[PUB] Recovery failed; aborting publish"));
+      return false;
+    }
+    // Try once more after recovery
+    if (!mqttClient.beginMessage(topic)) {
+      Serial.println(F("[PUB] beginMessage() still failing; giving up"));
+      return false;
+    }
+  }
+
   mqttClient.print(json);
   bool ok = mqttClient.endMessage();
-  Serial.print("[PUB] endMessage() -> "); Serial.println(ok ? "OK" : "FAIL");
+  Serial.print(F("[PUB] endMessage() -> "));
+  Serial.println(ok ? F("OK") : F("FAIL"));
+
+  // Drain a bit of traffic
   unsigned long t0 = millis();
-  while (millis() - t0 < 800) { mqttClient.poll(); delay(20); }  // drain ~0.8s
+  while (millis() - t0 < 800) {
+    mqttClient.poll();
+    delay(20);
+  }
+
+  if (!ok) {
+    Serial.println(F("[PUB] Telemetry send failed, attempting recovery..."));
+    recoverNetworkAndMqtt();  // if this also fails, helper may reboot
+  }
+
   return ok;
 }
+
 
 void scheduleNextTimeSync(bool success) {
   if (success) {
@@ -1111,6 +1192,7 @@ void flashLED(uint8_t no_of_flashes, uint16_t delay_time)
 //  SETUP
 ///////////////////////////////////////////////////////////
 void setup() {
+  Watchdog.disable();   // make sure a previous run didn't leave it ticking
   //Pins
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
@@ -1123,6 +1205,12 @@ void setup() {
   //Serial Comms
   Serial.begin(115200);
   unsigned long t0 = millis(); while (!Serial && millis()-t0 < 4000) {}
+
+  // Enable watchdog during boot sequences
+//  int wdtMs = Watchdog.enable(WDT_TIMEOUT_MS);
+//  Serial.print(F("[WDT] Boot watchdog enabled, timeout ~"));
+//  Serial.print(wdtMs);
+//  Serial.println(F(" ms"));
 
   if(getSettings())  //  Read SlingShot Configs
   {
@@ -1186,6 +1274,8 @@ if (!mqttConnectFlag) {
   unsigned long t1 = millis();
   while (millis() - t1 < 1000) { mqttClient.poll(); delay(20); }
   
+  // We’ll re-enable the watchdog inside loop() on each wake
+  Watchdog.disable();
 
 }
 
@@ -1194,9 +1284,13 @@ if (!mqttConnectFlag) {
 ///////////////////////////////////////////////////////////
 void loop()
 {
+  // Enable watchdog while we are awake and doing work
+  Watchdog.enable(WDT_TIMEOUT_MS);
   mqttClient.poll(); // keepalive
+  Watchdog.reset();  // we’re alive here
 
   if(rtcWakeFlag){  //  RTC Alarm (1min)
+    tsSendValue = rtc.getEpoch();  //  Time for JsonMsg if needed
     sampleTimeandDateFromRTC();
     rtcWakeFlag = false;
     #if ENABLE_DEBUG
@@ -1213,7 +1307,7 @@ void loop()
     }
     flashLED(2, 100);
     //See if 10minute period has arrived?
-    int modTest = (rtc.getMinutes()+1)%settings.samplingInterval;  //  Need to add 1 as now sampling just before the minute change on 59secs
+    int modTest = (sampleMinute+1)%settings.samplingInterval;  //  Need to add 1 as now sampling just before the minute change on 59secs
     if(modTest == 0){
       sendMsgFlag = true;
       #if ENABLE_DEBUG
@@ -1225,6 +1319,7 @@ void loop()
 
     resetAlarms();
     goToSleepFlag = true;
+    Watchdog.reset();   // finished handling the minute tick
   }
 
   if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
@@ -1242,7 +1337,6 @@ void loop()
   }
 
   if(sendMsgFlag){  //  Send Message
-    tsSendValue = rtc.getEpoch();  //  Time for JsonMsg
     sendMsgFlag = false;  //clear flag
     #if ENABLE_DEBUG
       Serial.println("sendMessage!");
@@ -1263,6 +1357,9 @@ void loop()
     if (!mqttClient.connected()) {
       timeSyncTick();
     }
+
+    Watchdog.reset();   // we successfully made it through send & SD
+
     flashLED(3, 100);
     //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
     if(sampleHour == 23 && sampleMinute == 59){
@@ -1276,7 +1373,11 @@ void loop()
       Serial.println("Sleep!");
       delay(100);
     #endif
-    goToSleepFlag = false;  
+    goToSleepFlag = false;
+
+    // Disable WDT while we’re sleeping for ~60s
+    Watchdog.disable();
+    delay(100);
     LowPower.idle();
     //LowPower.deepSleep();
   }

@@ -4,22 +4,28 @@
 serialNo = 212702
 
 # Device ID
-device_id = HPT01
+deviceID = HPT01
 
 # APN
 apn = gigsky-02
-apn_user =
-apn_pass =
+apnUser =
+apnPass =
 pin =
 
-# sensors_mode -  0 = Rain and River Level, 1 = Rain only, 2 = River Level only
-sensors_mode = 0
+#ThingsBoard
+tbHostString = mqtt.eu.thingsboard.cloud
+tbPortInt = 1883
+tbTopicString = v1/devices/me/telemetry
+tbTokenString = uo423fza9leqz4pry7cb
 
-# rtc_alarm_second - The second the alarm is triggered
-rtc_alarm_second = 58
+# sensorsMode -  0 = Rain and River Level, 1 = Rain only, 2 = River Level only
+sensorsMode = 0
 
-# sampling_interval - In minutes
-sampling_interval = 10
+# rtcAlarmSecond - The second the alarm is triggered
+rtcAlarmSecond = 58
+
+# samplingInterval - In minutes
+samplingInterval = 10
 
 # riverLevelRange - Max range in cm
 riverLevelRange = 600

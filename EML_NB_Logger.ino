@@ -45,57 +45,18 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 #include <RTCZero.h>
 #include <ArduinoLowPower.h>
 #include <TimeLib.h>
-//#include <Adafruit_ADS1X15.h>
 #include <ArduinoMqttClient.h>
 #include <SPI.h>
 #include <SD.h>
 /************************************************************
  * Enables debug support. To disable this feature set to 0.
  ***********************************************************/
-#define ENABLE_DEBUG                       1
-// ===================== User config =====================
-#define VBAT_PIN A6
-//////////////////////////////////////////
-////    Default Configurations  //////////
-////////////////////////////////////////// 
+#define ENABLE_DEBUG          1
+#define VBAT_PIN              A6
 #define DEFAULT_INT_VALUE     0
 #define DEFAULT_BOOL_VALUE    false
 #define DEFAULT_STRING_VALUE  "default"
 #define DEFAULT_BYTE_VALUE    0x00
-
-// Configuration settings (from SD Card)
-struct parameters {
-String serialNo;
-String device_id;
-String apn;
-String apn_user;
-String apn_pass;
-String pin;
-int sensors_mode;
-int rtc_alarm_second;
-int sampling_interval;
-String riverLevelRange;
-String rainGaugeCF;
-} settings;
-
-float riverLevelRange_float;
-float rainGaugeCF_float;
-
-const int SDchipSelect = 4;
-const int FLASHchipSelect = 5;
-const String logFile = "log.txt";
-
-// ---- ThingsBoard EU MQTT ----
-const char TB_HOST[]   = "mqtt.eu.thingsboard.cloud"; // EU cluster
-const int  TB_PORT    = 1883;
-const char*   TB_TOPIC   = "v1/devices/me/telemetry";
-const char*   TB_TOKEN   = "uo423fza9leqz4pry7cb"; // username for MQTT - Token on TB
-
-// =======================================================
-IPAddress timeServer(129, 6, 15, 28); // time.nist.gov NTP server
-const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
-byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
-unsigned int localPort = 2390;      // local port to listen for UDP packets
 
 /* Initialise Library instances */
 RTCZero rtc;
@@ -104,13 +65,40 @@ NB nbAccess;
 NBScanner scanner;
 NBClient nbClient;
 MqttClient mqttClient(nbClient);
-// A UDP instance to let us send and receive packets over UDP
 NBUDP Udp;
-//Adafruit_ADS1115 ads;
 
 File    configFile;
-char    configChar;
 
+// Configuration settings (from SD Card)
+struct parameters {
+  String serialNo;
+  String deviceID;
+  String apn;
+  String apnUser;
+  String apnPass;
+  String pin;
+  String tbHostString;
+  uint16_t tbPortInt;
+  String tbTopicString;
+  String tbTokenString;
+  int sensorsMode;
+  int rtcAlarmSecond;
+  int samplingInterval;
+  String riverLevelRange;
+  String rainGaugeCF;
+} settings;
+
+float riverLevelRange_float;
+float rainGaugeCF_float;
+const int SDchipSelect = 4;
+const int FLASHchipSelect = 5;
+const String logFile = "log.txt";
+char    configChar;
+// =======================================================
+IPAddress timeServer(129, 6, 15, 28); // time.nist.gov NTP server
+const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
+byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
+unsigned int localPort = 2390;      // local port to listen for UDP packets
 // Flags
 bool NTP_updatedFlag = false;
 volatile bool rtcWakeFlag = false;
@@ -120,24 +108,19 @@ bool goToSleepFlag = false;
 bool nbAttachAPN_Flag = false;
 bool mqttConnectFlag = false;
 bool ntpUpdateFlag = false;
-
 // --- Time sync state ---
 bool useServerTimestamp = true;                 // start with TB server time until we sync
 uint32_t nextTimeSyncMs = 0;                    // millis() when we may try again
 uint32_t timeSyncBackoffMs = 5UL*60UL*1000UL;   // start with 5 minutes
-
 // Pins
 const int PIN_RAIN = 7;  // contact-closure input (to GND)
 const int PIN_RL_EN = 6;  // River Level Enable
-
 // Globals
 volatile uint32_t rainTipsCounter = 0;
 volatile uint32_t rain24hrTipsCounter = 0;
 volatile uint32_t lastPulseUs = 0;
-
 String previousSDfilename = "";
 String currentSDfilename = "";
-
 // minute samples
 float batteryVolts = 0;
 uint8_t sampleNo = 0;
@@ -166,7 +149,7 @@ uint8_t sampleSecond;
 //  Helper Functions
 ///////////////////////////////////////////////////////////
 void resetAlarms(){
-    rtc.setAlarmSeconds(settings.rtc_alarm_second);
+    rtc.setAlarmSeconds(settings.rtcAlarmSecond);
     rtc.enableAlarm(rtc.MATCH_SS);
 }
 
@@ -190,16 +173,14 @@ String createSDfilename(){
 }
 
 void writeSDcard(String SDfilename, String dataString){
-    Serial.print("Initializing SD card...");
-
-    // see if the card is present and can be initialized:
-    if (!SD.begin(SDchipSelect)) {
-      Serial.println("Card failed, or not present");
-      // don't do anything more:
-      while (1);
-    }
-    Serial.println("card initialized.");
-
+  Serial.print("Initializing SD card...");
+  // see if the card is present and can be initialized:
+  if (!SD.begin(SDchipSelect)) {
+    Serial.println("Card failed, or not present");
+    // don't do anything more:
+    while (1);
+  }
+  Serial.println("card initialized.");
   // open the file. note that only one file can be open at a time,
   // so you have to close this one before opening another.
   File dataFile = SD.open(SDfilename, FILE_WRITE);
@@ -217,8 +198,8 @@ void writeSDcard(String SDfilename, String dataString){
     Serial.println(SDfilename);
   }
   delay(1000);
-
 }
+
 void writeSDcardLog(String dataString){
   String dataStringLog = "";
 
@@ -232,19 +213,19 @@ void writeSDcardLog(String dataString){
   dataStringLog += ":";
   dataStringLog += rtc.getMinutes();
   dataStringLog += ":";
-  dataStringLog += rtc.getSeconds();  
+  dataStringLog += rtc.getSeconds();
+  dataStringLog += " ";
   dataStringLog += dataString;
   dataStringLog += "\n"; 
   writeSDcard(logFile, dataStringLog);
 }
 
-// Registration-first attach: wait for CEREG=1/5 before touching PDP
 bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000, uint32_t pdpDeadlineMs = 30000) {
   int st = 0;
   unsigned long t0 = millis();
   Serial.println("[NET] NB.begin(PIN+APN)...");
   while(st != 3  || (millis() - t0 < beginDeadlineMs)){
-    st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apn_user.c_str(), settings.apn_pass.c_str());
+    st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apnUser.c_str(), settings.apnPass.c_str());
   }
   if(st == 3){
     Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
@@ -294,11 +275,10 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
     }
     delay(500);
   }
-
   // One clean refresh if PDP didn’t appear
   Serial.println("[NET] PDP timed out; refreshing modem once...");
   nbAccess.shutdown(); delay(1500);
-  st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apn_user.c_str(), settings.apn_pass.c_str());
+  st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apnUser.c_str(), settings.apnPass.c_str());
   Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
 
   // Re-check registration briefly
@@ -328,7 +308,6 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   return false;
 }
 
-
 void printMqttErr(int e) {
   Serial.print("[MQTT] connectError="); Serial.println(e);
   switch (e) {
@@ -342,8 +321,8 @@ void printMqttErr(int e) {
 
 // --- MQTT helpers ---
 void setupMqttClient() {
-  mqttClient.setId(settings.device_id);                 // non-empty clientId (yours)
-  mqttClient.setUsernamePassword(TB_TOKEN, ""); // TB token as username, blank password
+  mqttClient.setId(settings.deviceID);                 // non-empty clientId (yours)
+  mqttClient.setUsernamePassword(settings.tbTokenString.c_str(), ""); // TB token as username, blank password
   mqttClient.setKeepAliveInterval(45 * 1000);   // NB/LTE-M friendly
   mqttClient.beginWill("v1/devices/me/attributes", false, 0);
   mqttClient.print("{\"status\":\"offline\"}");
@@ -364,7 +343,7 @@ bool ensureMqttConnected(const char* host, int port) {
 
 // Publish JSON and give the modem time to flush
 bool publishTelemetryJSON(const char* topic, const String& json) {
-  if (!ensureMqttConnected(TB_HOST, TB_PORT)) return false;
+  if (!ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt)) return false;
   if (!mqttClient.beginMessage(topic)) {
     Serial.println("[PUB] beginMessage() failed");
     return false;
@@ -597,193 +576,6 @@ void timeSyncTick() {
   }
 }
 
-///////////////////////////////////////////////////////////
-//  SETUP
-///////////////////////////////////////////////////////////
-void setup() {
-
-  //Pins
-  pinMode(LED_BUILTIN, OUTPUT);
-  // Rain input
-  pinMode(PIN_RAIN, INPUT_PULLUP);
-  LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
-  
-  analogReadResolution(12);
-
-
-
-  //Serial Comms
-  Serial.begin(115200);
-  unsigned long t0 = millis(); while (!Serial && millis()-t0 < 4000) {}
-
-  if(getSettings())  //  Read SlingShot Configs
-  {
-    Serial.println("Get Settings - Success");
-    serialPrintSettings();  //  Print configs to screen
-  }
-  else
-  {
-    Serial.println("Get Settings - Failed");
-  }
-
-  //Intialise limits from uploaded settings
-  riverLevelMin = riverLevelRange_float;
-  riverLevelMinSendValue = riverLevelRange_float;
-
-  // RTC Setup
-  rtc.begin(); // initialize RTC 24H format
-  rtc.setAlarmSeconds(0);
-  rtc.setAlarmSeconds(settings.rtc_alarm_second);
-  rtc.enableAlarm(rtc.MATCH_SS);
-  rtc.attachInterrupt(rtcWakeISR);
-
-  Serial.println("\n=== BOOT ===");
-  nbAttachAPN_Flag = nbAttachAPN();
-  if (!nbAttachAPN_Flag) {
-    Serial.println("[BOOT] Attach failed — not proceeding.");
-    writeSDcardLog("[BOOT] Attach failed — not proceeding");
-    return;
-  }
-
-setupMqttClient();                       // your working helper
-mqttConnectFlag = ensureMqttConnected(TB_HOST, TB_PORT);
-if (!mqttConnectFlag) {
-  // one short PDP refresh + single retry
-  gprs.detachGPRS(); delay(600);
-  if (nbAttachAPN(20000, 20000, 20000)) {
-    mqttConnectFlag = ensureMqttConnected(TB_HOST, TB_PORT);
-  }
-  if(!mqttConnectFlag){
-    Serial.println("[MQQT] Connection failed — not proceeding.");
-    writeSDcardLog("[MQQT] Connection failed — not proceeding.");
-  }
-}
-
-  ntpUpdateFlag = timeSyncOnce();
-
-  if(ntpUpdateFlag == false){
-    writeSDcardLog("[NTP] NTP Clock Update Failed");
-  }
-
-  // Give the modem ~1s to flush
-  unsigned long t1 = millis();
-  while (millis() - t1 < 1000) { mqttClient.poll(); delay(20); }
-  Serial.println("[DONE] Connect.");
-
-}
-
-
-///////////////////////////////////////////////////////////
-//  START OF LOOP
-///////////////////////////////////////////////////////////
-void loop()
-{
-
-  mqttClient.poll(); // keepalive
-//takeRiverLevelSamples(currentSampleNo);  //RL TEST
-//delay(1000);
-
-  if(rtcWakeFlag){  //  RTC Alarm (1min)
-
-  sampleTimeandDateFromRTC();
-  //sampleTimeandDateFromRTC();
-    rtcWakeFlag = false;
-    #if ENABLE_DEBUG
-      Serial.println("rtcWakeISR!");
-    #endif
-    //Read the LiPo battery volts level
-    readBatteryVoltage();
-    // Sample Sensors
-    if(settings.sensors_mode == 0 || settings.sensors_mode == 2){  //River Level
-      takeRiverLevelSamples(currentSampleNo);
-    }
-    if(settings.sensors_mode == 0 || settings.sensors_mode == 1){  //Rain
-      takeRainSamples(currentSampleNo);
-    }
-
-    //See if 10minute period has arrived?
-    int modTest = (rtc.getMinutes()+1)%settings.sampling_interval;  //  Need to add 1 as now sampling just before the minute change on 59secs
-    if(modTest == 0){
-      sendMsgFlag = true;
-      #if ENABLE_DEBUG
-        Serial.println("Modulus!");
-      #endif
-    }
-    //Increment currentSampleNo
-    currentSampleNo++;  // Increment sample counter
-
-    resetAlarms();
-    goToSleepFlag = true;
-  }
-
-  if(settings.sensors_mode == 0 || settings.sensors_mode == 1){  //Rain
-    if(rainWakeFlag){  // Rain Sensor Alarm
-      rainWakeFlag = false;
-
-      #if ENABLE_DEBUG
-        Serial.print("rainWakeISR!, ");
-        Serial.print("rainCount: "); Serial.print(rainTipsCounter);
-        Serial.print(", rainCount24hr: "); Serial.println(rain24hrTipsCounter);
-      #endif
-      resetAlarms();
-      goToSleepFlag = true;
-    }
-  }
-
-  if(sendMsgFlag){  //  Send Message
-    tsSendValue = rtc.getEpoch();  //  Time for JsonMsg
-    sendMsgFlag = false;  //clear flag
-    #if ENABLE_DEBUG
-      Serial.println("sendMessage!");
-    #endif  
-
-    //  This is where we do the sample averaging and message creation!
-    calcSamples(currentSampleNo);
-    createAndSendJsonMsg(); 
-
-    //SD Card
-    currentSDfilename = createSDfilename();
-    if (currentSDfilename != previousSDfilename){  //New file so new header needed
-      writeSDcard(currentSDfilename, createSDcardPayloadHeader());  //  Write new header on new file
-      previousSDfilename = currentSDfilename;  //  Update previous filename so we can move on...
-    }
-    writeSDcard(currentSDfilename, createSDcardPayload());  //  Write data
-
-    // after publish + drain
-    if (!mqttClient.connected()) {
-      timeSyncTick();
-    }
-
-
-    //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
-    if(sampleHour == 23 && sampleMinute == 59){
-      rain24hrTipsCounter = 0;
-    }
-  }
-
-    // Sleep!
-    if(goToSleepFlag){
-      #if ENABLE_DEBUG
-        Serial.println("Sleep!");
-        delay(100);
-      #endif
-      goToSleepFlag = false;  
-      LowPower.idle();
-      //LowPower.deepSleep();
-    }
-
-
-}
-///////////////////////////////////////////////////////////
-//  END OF LOOP
-///////////////////////////////////////////////////////////
-
-/****************************************************************/
-//                        FUNCTIONS                             //
-/****************************************************************/
-
-// Sample Function
-
 void readBatteryVoltage() {
   int raw = analogRead(VBAT_PIN);   // 0–4095 for 12-bit ADC
   batteryVolts = (raw / 4095.0) * 3.3 * 2; // *2 because of onboard divider
@@ -852,7 +644,7 @@ void takeRainSamples(uint16_t no_of_samples) {
 // Process Sensors Function (inc Rain Reset if day change?)
 void calcSamples(uint16_t no_of_samples){
 Serial.println("calcSamples");
-  if(settings.sensors_mode == 0 || settings.sensors_mode == 2){  //River Level
+  if(settings.sensorsMode == 0 || settings.sensorsMode == 2){  //River Level
     riverLevelAveSendValue = riverLevelTotal/no_of_samples;  //  Calculate the average river level during the sampling period
     #if ENABLE_MAX_MIN_RL
       riverLevelMaxSendValue = riverLevelMax;
@@ -863,7 +655,7 @@ Serial.println("calcSamples");
     riverLevelTotal = 0;
   }
 
-  if(settings.sensors_mode == 0 || settings.sensors_mode == 1){  //Rain
+  if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
     rainIntervalSendValue = rainTipsCounter * rainGaugeCF_float;
     rain24hrSendValue = rain24hrTipsCounter * rainGaugeCF_float;
     rainTipsCounter = 0;
@@ -879,10 +671,10 @@ void createAndSendJsonMsg(){
   if (!useServerTimestamp) {
     // use device timestamp (array with ts + values)
     uint32_t ts = rtc.getEpoch();     // seconds since 1970
-    if (settings.sensors_mode == 0) {
+    if (settings.sensorsMode == 0) {
       payload += "[{\"ts\":"; payload += ts; payload += "000";
       payload += ",\"values\":{";
-      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
+      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
       payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
       payload += "\"rlAve\":";   payload += riverLevelAveSendValue;    payload += ",";
       #if ENABLE_MAX_MIN_RL
@@ -892,17 +684,17 @@ void createAndSendJsonMsg(){
       payload += "\"rainInt\":"; payload += rainIntervalSendValue;     payload += ",";
       payload += "\"rain24hr\":";payload += rain24hrSendValue;
       payload += "}}]";
-    } else if (settings.sensors_mode == 1) {
+    } else if (settings.sensorsMode == 1) {
       payload += "[{\"ts\":"; payload += ts; payload += "000";
       payload += ",\"values\":{";
-      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
+      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
       payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
       payload += "\"rain24hr\":"; payload += rain24hrSendValue;
       payload += "}}]";
     } else { // 2
       payload += "[{\"ts\":"; payload += ts; payload += "000";
       payload += ",\"values\":{";
-      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
+      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
       payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; 
       #if ENABLE_MAX_MIN_RL
       payload += ",";
@@ -913,9 +705,9 @@ void createAndSendJsonMsg(){
     }
   } else {
     // server timestamp: plain object (no ts, no "values" wrapper)
-    if (settings.sensors_mode == 0) {
+    if (settings.sensorsMode == 0) {
       payload += "{";
-      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
+      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
       payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
       payload += "\"rlAve\":";   payload += riverLevelAveSendValue;    payload += ",";
       #if ENABLE_MAX_MIN_RL
@@ -925,15 +717,15 @@ void createAndSendJsonMsg(){
       payload += "\"rainInt\":"; payload += rainIntervalSendValue;     payload += ",";
       payload += "\"rain24hr\":";payload += rain24hrSendValue;
       payload += "}";
-    } else if (settings.sensors_mode == 1) {
+    } else if (settings.sensorsMode == 1) {
       payload += "{";
-      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
+      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
       payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
       payload += "\"rain24hr\":"; payload += rain24hrSendValue;
       payload += "}";
     } else {
       payload += "{";
-      payload += "\"device\":\""; payload += settings.device_id; payload += "\",";
+      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
       payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; 
       #if ENABLE_MAX_MIN_RL
       payload += ",";
@@ -945,12 +737,10 @@ void createAndSendJsonMsg(){
   }
 
   // Hardened publish you already added:
-  bool ok = publishTelemetryJSON(TB_TOPIC, payload);
-
+bool ok = publishTelemetryJSON(settings.tbTopicString.c_str(), payload);
 #if ENABLE_DEBUG
   Serial.print("Sent: "); Serial.println(payload);
   if (!ok) Serial.println("[PUB] Telemetry send failed");
-  flashLED(ok ? 1 : 3, 200);
 #endif
 }
 // Create message to SD save
@@ -961,7 +751,7 @@ String createSDcardPayloadHeader(){
     payloadHeader += ("Time"); payloadHeader += (",");
     payloadHeader += ("Device"); payloadHeader += (",");
     payloadHeader += ("BatteryVolts"); payloadHeader += (",");
-    if (settings.sensors_mode == 0){  //  Both RL and Rain
+    if (settings.sensorsMode == 0){  //  Both RL and Rain
       payloadHeader += ("RiverLevel-Ave"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
         payloadHeader += ("RiverLevel-Max"); payloadHeader += (",");
@@ -970,11 +760,11 @@ String createSDcardPayloadHeader(){
       payloadHeader += ("rainInterval"); payloadHeader += (",");
       payloadHeader += ("rain24hr"); payloadHeader += (",");
     }
-    else if (settings.sensors_mode == 1){  //  Rainfall Only
+    else if (settings.sensorsMode == 1){  //  Rainfall Only
       payloadHeader += ("rainInterval"); payloadHeader += (",");
       payloadHeader += ("rain24hr"); payloadHeader += (",");
     }
-    else if (settings.sensors_mode == 2){  // River Level Only
+    else if (settings.sensorsMode == 2){  // River Level Only
       payloadHeader += ("RiverLevel-Current"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
         payloadHeader += ("RiverLevel-Max"); payloadHeader += (",");
@@ -987,7 +777,7 @@ String createSDcardPayloadHeader(){
     payloadHeader += ("hh:mm:ss"); payloadHeader += (",");
     payloadHeader += ("Name"); payloadHeader += (",");
     payloadHeader += ("V"); payloadHeader += (",");
-    if (settings.sensors_mode == 0){  //  Both RL and Rain
+    if (settings.sensorsMode == 0){  //  Both RL and Rain
       payloadHeader += ("cm"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
         payloadHeader += ("cm"); payloadHeader += (",");
@@ -996,11 +786,11 @@ String createSDcardPayloadHeader(){
       payloadHeader += ("mm"); payloadHeader += (",");
       payloadHeader += ("mm"); payloadHeader += (",");
     }
-    else if (settings.sensors_mode == 1){  //  Rainfall Only
+    else if (settings.sensorsMode == 1){  //  Rainfall Only
       payloadHeader += ("mm"); payloadHeader += (",");
       payloadHeader += ("mm"); payloadHeader += (",");
     }
-    else if (settings.sensors_mode == 2){  // River Level Only
+    else if (settings.sensorsMode == 2){  // River Level Only
       payloadHeader += ("cm"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
         payloadHeader += ("cm"); payloadHeader += (",");
@@ -1017,9 +807,9 @@ String createSDcardPayload(){
 
     payload += (sampleYear+2000); payload += ("-"); payload += (sampleMonth); payload += ("-"); payload += (sampleDay); payload += (",");
     payload += (sampleHour); payload += (":"); payload += (sampleMinute); payload += (":"); payload += (sampleSecond); payload += (",");
-    payload += (settings.device_id); payload += (",");
+    payload += (settings.deviceID); payload += (",");
     payload += (batteryVolts); payload += (",");
-    if (settings.sensors_mode == 0){  //  Both RL and Rain
+    if (settings.sensorsMode == 0){  //  Both RL and Rain
       payload += (riverLevelAveSendValue); payload += (","); 
       #if ENABLE_MAX_MIN_RL
         payload += (riverLevelMaxSendValue); payload += (",");
@@ -1028,11 +818,11 @@ String createSDcardPayload(){
       payload += (rainIntervalSendValue); payload += (",");
       payload += (rain24hrSendValue); payload += (",");
     }
-    else if (settings.sensors_mode == 1){  //  Rainfall Only
+    else if (settings.sensorsMode == 1){  //  Rainfall Only
       payload += (rainIntervalSendValue); payload += (",");
       payload += (rain24hrSendValue); payload += (",");
     }
-    else if (settings.sensors_mode == 2){  // River Level Only
+    else if (settings.sensorsMode == 2){  // River Level Only
       payload += (riverLevelAveSendValue); payload += (","); 
       #if ENABLE_MAX_MIN_RL
         payload += (riverLevelMaxSendValue); payload += (",");
@@ -1040,90 +830,6 @@ String createSDcardPayload(){
       #endif    
     }
     return payload;
-}
-
-
-///////////////////////////////////////////////////////////
-//  TIME Functions
-///////////////////////////////////////////////////////////
-void getNTP()
-{
-  sendNTPpacket(timeServer); // send an NTP packet to a time server
-  // wait to see if a reply is available
-  delay(1000);
-  if ( Udp.parsePacket() ) {
-    #if ENABLE_DEBUG
-      Serial.println("NTP packet received");
-    #endif
-    // We've received a packet, read the data from it
-    Udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
-    //the timestamp starts at byte 40 of the received packet and is four bytes,
-    // or two words, long. First, extract the two words:
-    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-    // combine the four bytes (two words) into a long integer
-    // this is NTP time (seconds since Jan 1 1900):
-    unsigned long secsSince1900 = highWord << 16 | lowWord;
-    // now convert NTP time into everyday time:
-    // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
-    const unsigned long seventyYears = 2208988800UL;
-    // subtract seventy years:
-    unsigned long epoch = secsSince1900 - seventyYears;
-
-    setTime(epoch);   // load epoch into time library
-    rtc.setTime(hour(), minute(), second());
-    rtc.setDate(day(), month(), (year()-2000));
-
-    #if ENABLE_DEBUG
-      Serial.print("UTC: ");
-      Serial.print(year());
-      Serial.print("-");
-      Serial.print(month());
-      Serial.print("-");
-      Serial.print(day());
-      Serial.print(" ");
-      Serial.print(hour());
-      Serial.print(":");
-      Serial.print(minute());
-      Serial.print(":");
-      Serial.println(second());
-    #endif
-    flashLED(5, 100);
-    NTP_updatedFlag = true;  // Time has been set
-  }
-
-  // wait ten seconds before asking for the time again
-//  delay(10000);
-}
-
-unsigned long sendNTPpacket(IPAddress& address)
-{
-  //Serial.println("1");
-  // set all bytes in the buffer to 0
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
-  //Serial.println("2");
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
-  packetBuffer[3] = 0xEC;  // Peer Clock Precision
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12]  = 49;
-  packetBuffer[13]  = 0x4E;
-  packetBuffer[14]  = 49;
-  packetBuffer[15]  = 52;
-
-  //Serial.println("3");
-
-  // all NTP fields have been given values, now
-  // you can send a packet requesting a timestamp:
-  Udp.beginPacket(address, 123); //NTP requests are to port 123
-  //Serial.println("4");
-  Udp.write(packetBuffer, NTP_PACKET_SIZE);
-  //Serial.println("5");
-  Udp.endPacket();
-  //Serial.println("6");
 }
 
 ////////////////////////////////////////
@@ -1146,6 +852,7 @@ boolean getSettings()
 
   configFile = SD.open("SETTINGS.TXT");
   if (!configFile) {
+    Serial.println("Settings not opened");
     return false;
   }
 
@@ -1179,42 +886,61 @@ boolean getSettings()
         settings.serialNo = getStringSetting(DEFAULT_STRING_VALUE);
         settings.serialNo.trim();
       }
-      else if (description == "device_id") 
+      else if (description == "deviceID") 
       {
-        settings.device_id = getStringSetting(DEFAULT_STRING_VALUE);
-        settings.device_id.trim();
+        settings.deviceID = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.deviceID.trim();
       }
       else if (description == "apn") 
       {
         settings.apn = getStringSetting(DEFAULT_STRING_VALUE);
         settings.apn.trim();
       }
-      else if (description == "apn_user") 
+      else if (description == "apnUser") 
       {
-        settings.apn_user = getStringSetting(DEFAULT_STRING_VALUE);
-        settings.apn_user.trim();
+        settings.apnUser = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.apnUser.trim();
       }
-      else if (description == "apn_pass") 
+      else if (description == "apnPass") 
       {
-        settings.apn_pass = getStringSetting(DEFAULT_STRING_VALUE);
-        settings.apn_pass.trim();
+        settings.apnPass = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.apnPass.trim();
       }
       else if (description == "pin") 
       {
         settings.pin = getStringSetting(DEFAULT_STRING_VALUE);
         settings.pin.trim();
       }
-      else if (description == "sensors_mode") 
+      else if (description == "tbHostString") 
       {
-        settings.sensors_mode = getIntSetting(DEFAULT_INT_VALUE);
+        settings.tbHostString = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.tbHostString.trim();
       }
-      else if (description == "rtc_alarm_second") 
+      else if (description == "tbPortInt") 
       {
-        settings.rtc_alarm_second = getIntSetting(DEFAULT_INT_VALUE);
+        settings.tbPortInt = getIntSetting(DEFAULT_INT_VALUE);
+      }
+      else if (description == "tbTopicString") 
+      {
+        settings.tbTopicString = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.tbTopicString.trim();
+      }
+      else if (description == "tbTokenString") 
+      {
+        settings.tbTokenString = getStringSetting(DEFAULT_STRING_VALUE);
+        settings.tbTokenString.trim();
+      }
+      else if (description == "sensorsMode") 
+      {
+        settings.sensorsMode = getIntSetting(DEFAULT_INT_VALUE);
+      }
+      else if (description == "rtcAlarmSecond") 
+      {
+        settings.rtcAlarmSecond = getIntSetting(DEFAULT_INT_VALUE);
       } 
-      else if (description == "sampling_interval") 
+      else if (description == "samplingInterval") 
       {
-        settings.sampling_interval = getIntSetting(DEFAULT_INT_VALUE);
+        settings.samplingInterval = getIntSetting(DEFAULT_INT_VALUE);
       } 
       else if (description == "riverLevelRange") 
       {
@@ -1340,22 +1066,30 @@ void serialPrintSettings()
   Serial.println(F("-------------------------------------------------"));
   Serial.print(F("serialNo: "));
   Serial.println(settings.serialNo);
-  Serial.print(F("device_id: "));
-  Serial.println(settings.device_id);
+  Serial.print(F("deviceID: "));
+  Serial.println(settings.deviceID);
   Serial.print(F("apn: "));
   Serial.println(settings.apn);  
-  Serial.print(F("apn_user: "));
-  Serial.println(settings.apn_user);  
-  Serial.print(F("apn_pass: "));
-  Serial.println(settings.apn_pass);  
+  Serial.print(F("apnUser: "));
+  Serial.println(settings.apnUser);  
+  Serial.print(F("apnPass: "));
+  Serial.println(settings.apnPass);  
   Serial.print(F("pin: "));
   Serial.println(settings.pin);  
-  Serial.print(F("sensors_mode: "));
-  Serial.println(settings.sensors_mode);  
-  Serial.print(F("rtc_alarm_second: "));
-  Serial.println(settings.rtc_alarm_second);  
-  Serial.print(F("sampling_interval(min): "));
-  Serial.println(settings.sampling_interval);  
+  Serial.print(F("tbHostString: "));
+  Serial.println(settings.tbHostString);  
+  Serial.print(F("tbPortInt: "));
+  Serial.println(settings.tbPortInt);  
+  Serial.print(F("tbTopicString: "));
+  Serial.println(settings.tbTopicString);  
+  Serial.print(F("tbTokenString: "));
+  Serial.println(settings.tbTokenString);  
+  Serial.print(F("sensorsMode: "));
+  Serial.println(settings.sensorsMode);  
+  Serial.print(F("rtcAlarmSecond: "));
+  Serial.println(settings.rtcAlarmSecond);  
+  Serial.print(F("samplingInterval(min): "));
+  Serial.println(settings.samplingInterval);  
   Serial.print(F("riverLevelRange: "));
   Serial.println(settings.riverLevelRange);  
   Serial.print(F("rainGaugeCF: "));
@@ -1373,6 +1107,187 @@ void flashLED(uint8_t no_of_flashes, uint16_t delay_time)
   }
 }
 
+///////////////////////////////////////////////////////////
+//  SETUP
+///////////////////////////////////////////////////////////
+void setup() {
+  //Pins
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  // Rain input
+  pinMode(PIN_RAIN, INPUT_PULLUP);
+  LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
+  
+  analogReadResolution(12);
+
+  //Serial Comms
+  Serial.begin(115200);
+  unsigned long t0 = millis(); while (!Serial && millis()-t0 < 4000) {}
+
+  if(getSettings())  //  Read SlingShot Configs
+  {
+    Serial.println("Get Settings - Success");
+    serialPrintSettings();  //  Print configs to screen
+  }
+  else
+  {
+    Serial.println("Get Settings - Failed");
+    writeSDcardLog("[SD] Get Settings - Failed");
+    flashLED(5, 200);
+  }
+
+  //Intialise limits from uploaded settings
+  riverLevelMin = riverLevelRange_float;
+  riverLevelMinSendValue = riverLevelRange_float;
+
+  // RTC Setup
+  rtc.begin(); // initialize RTC 24H format
+  rtc.setAlarmSeconds(0);
+  rtc.setAlarmSeconds(settings.rtcAlarmSecond);
+  rtc.enableAlarm(rtc.MATCH_SS);
+  rtc.attachInterrupt(rtcWakeISR);
+
+  Serial.println("\n=== BOOT ===");
+  nbAttachAPN_Flag = nbAttachAPN();
+  if (!nbAttachAPN_Flag) {
+    Serial.println("[BOOT] Attach failed — not proceeding.");
+    writeSDcardLog("[BOOT] Attach failed — not proceeding");
+    flashLED(5, 200);
+    return;
+  }
+
+setupMqttClient();                       // your working helper
+mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
+if (!mqttConnectFlag) {
+  // one short PDP refresh + single retry
+  gprs.detachGPRS(); delay(600);
+  if (nbAttachAPN(20000, 20000, 20000)) {
+    mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
+  }
+  if(!mqttConnectFlag){
+    Serial.println("[MQQT] Connection failed — not proceeding.");
+    writeSDcardLog("[MQQT] Connection failed — not proceeding.");
+    flashLED(5, 200);
+  }
+}
+
+  ntpUpdateFlag = timeSyncOnce();
+
+  if(ntpUpdateFlag == false){
+    writeSDcardLog("[NTP] NTP Clock Update Failed");
+    flashLED(10, 200);
+  }
+  if(nbAttachAPN_Flag == true && mqttConnectFlag == true && ntpUpdateFlag == true){
+    Serial.println("[BOOT] Connected.");
+    writeSDcardLog("[BOOT] Success");
+    flashLED(1, 2000);
+  }
+  // Give the modem ~1s to flush
+  unsigned long t1 = millis();
+  while (millis() - t1 < 1000) { mqttClient.poll(); delay(20); }
+  
+
+}
+
+///////////////////////////////////////////////////////////
+//  START OF LOOP
+///////////////////////////////////////////////////////////
+void loop()
+{
+  mqttClient.poll(); // keepalive
+
+  if(rtcWakeFlag){  //  RTC Alarm (1min)
+    flashLED(2, 100);
+    sampleTimeandDateFromRTC();
+    rtcWakeFlag = false;
+    #if ENABLE_DEBUG
+      Serial.println("rtcWakeISR!");
+    #endif
+    //Read the LiPo battery volts level
+    readBatteryVoltage();
+    // Sample Sensors
+    if(settings.sensorsMode == 0 || settings.sensorsMode == 2){  //River Level
+      takeRiverLevelSamples(currentSampleNo);
+    }
+    if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
+      takeRainSamples(currentSampleNo);
+    }
+
+    //See if 10minute period has arrived?
+    int modTest = (rtc.getMinutes()+1)%settings.samplingInterval;  //  Need to add 1 as now sampling just before the minute change on 59secs
+    if(modTest == 0){
+      sendMsgFlag = true;
+      #if ENABLE_DEBUG
+        Serial.println("Modulus!");
+      #endif
+    }
+    //Increment currentSampleNo
+    currentSampleNo++;  // Increment sample counter
+
+    resetAlarms();
+    goToSleepFlag = true;
+  }
+
+  if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
+    if(rainWakeFlag){  // Rain Sensor Alarm
+      rainWakeFlag = false;
+      flashLED(1, 100);
+      #if ENABLE_DEBUG
+        Serial.print("rainWakeISR!, ");
+        Serial.print("rainCount: "); Serial.print(rainTipsCounter);
+        Serial.print(", rainCount24hr: "); Serial.println(rain24hrTipsCounter);
+      #endif
+      resetAlarms();
+      goToSleepFlag = true;
+    }
+  }
+
+  if(sendMsgFlag){  //  Send Message
+    tsSendValue = rtc.getEpoch();  //  Time for JsonMsg
+    sendMsgFlag = false;  //clear flag
+    #if ENABLE_DEBUG
+      Serial.println("sendMessage!");
+    #endif  
+    flashLED(3, 100);
+    //  This is where we do the sample averaging and message creation!
+    calcSamples(currentSampleNo);
+    createAndSendJsonMsg(); 
+
+    //SD Card
+    currentSDfilename = createSDfilename();
+    if (currentSDfilename != previousSDfilename){  //New file so new header needed
+      writeSDcard(currentSDfilename, createSDcardPayloadHeader());  //  Write new header on new file
+      previousSDfilename = currentSDfilename;  //  Update previous filename so we can move on...
+    }
+    writeSDcard(currentSDfilename, createSDcardPayload());  //  Write data
+
+    // after publish + drain
+    if (!mqttClient.connected()) {
+      timeSyncTick();
+    }
+
+    //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
+    if(sampleHour == 23 && sampleMinute == 59){
+      rain24hrTipsCounter = 0;
+    }
+  }
+
+  // Sleep!
+  if(goToSleepFlag){
+    #if ENABLE_DEBUG
+      Serial.println("Sleep!");
+      delay(100);
+    #endif
+    goToSleepFlag = false;  
+    LowPower.idle();
+    //LowPower.deepSleep();
+  }
+}
+
+///////////////////////////////////////////////////////////
+//  END OF LOOP
+///////////////////////////////////////////////////////////
+
 // Interrupt Functions
 void rtcWakeISR()
 {
@@ -1382,7 +1297,7 @@ void rtcWakeISR()
 // Rain Interrupt function
 // ISR for rain tips (debounced)
 void rainWakeISR() {
-  if(settings.sensors_mode == 0 || settings.sensors_mode == 1){  //Rain
+  if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
     uint32_t t = micros();
     rainWakeFlag = true;
     if (t - lastPulseUs > 10000) { // ~10 ms debounce

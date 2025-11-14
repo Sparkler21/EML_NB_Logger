@@ -1197,7 +1197,6 @@ void loop()
   mqttClient.poll(); // keepalive
 
   if(rtcWakeFlag){  //  RTC Alarm (1min)
-    flashLED(2, 100);
     sampleTimeandDateFromRTC();
     rtcWakeFlag = false;
     #if ENABLE_DEBUG
@@ -1212,7 +1211,7 @@ void loop()
     if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
       takeRainSamples(currentSampleNo);
     }
-
+    flashLED(2, 100);
     //See if 10minute period has arrived?
     int modTest = (rtc.getMinutes()+1)%settings.samplingInterval;  //  Need to add 1 as now sampling just before the minute change on 59secs
     if(modTest == 0){
@@ -1248,7 +1247,6 @@ void loop()
     #if ENABLE_DEBUG
       Serial.println("sendMessage!");
     #endif  
-    flashLED(3, 100);
     //  This is where we do the sample averaging and message creation!
     calcSamples(currentSampleNo);
     createAndSendJsonMsg(); 
@@ -1265,7 +1263,7 @@ void loop()
     if (!mqttClient.connected()) {
       timeSyncTick();
     }
-
+    flashLED(3, 100);
     //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
     if(sampleHour == 23 && sampleMinute == 59){
       rain24hrTipsCounter = 0;

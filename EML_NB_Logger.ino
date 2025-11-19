@@ -49,6 +49,7 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 #include <SPI.h>
 #include <SD.h>
 #include <Adafruit_SleepyDog.h>
+#include <TinyGPS.h>
 /************************************************************
  * Enables debug support. To disable this feature set to 0.
  ***********************************************************/
@@ -67,6 +68,7 @@ NBScanner scanner;
 NBClient nbClient;
 MqttClient mqttClient(nbClient);
 NBUDP Udp;
+TinyGPS gps;
 
 File    configFile;
 
@@ -113,6 +115,7 @@ bool goToSleepFlag = false;
 bool nbAttachAPN_Flag = false;
 bool mqttConnectFlag = false;
 bool ntpUpdateFlag = false;
+bool gpsUpdateFlag = false;
 // --- Time sync state ---
 bool useServerTimestamp = true;                 // start with TB server time until we sync
 uint32_t nextTimeSyncMs = 0;                    // millis() when we may try again
@@ -120,6 +123,7 @@ uint32_t timeSyncBackoffMs = 5UL*60UL*1000UL;   // start with 5 minutes
 // Pins
 const int PIN_RAIN = 7;  // contact-closure input (to GND)
 const int PIN_RL_EN = 6;  // River Level Enable
+const int GPSpowerPin = 0;
 // Globals
 volatile uint32_t rainTipsCounter = 0;
 volatile uint32_t rain24hrTipsCounter = 0;
@@ -150,8 +154,15 @@ uint8_t sampleHour;
 uint8_t sampleMinute;
 uint8_t sampleSecond;  
 
+float GPSlat;  // GPS Latitude
+float GPSlon;  // GPS Longditude
+uint16_t GPSupdateMins = 1440;  //  To set the number on minutes to elapse before updating GPS Date/Time/Location.
+uint16_t GPScounter = 0;
+bool GPStimeReceived = false;
+
 void forceReboot(const char* reason);
 bool recoverNetworkAndMqtt();
+void bootSequence();
 
 ///////////////////////////////////////////////////////////
 //  Helper Functions
@@ -208,6 +219,97 @@ void writeSDcard(String SDfilename, String dataString){
   delay(1000);
 }
 
+bool getGPSinfo(){
+
+  //TURN ON GPS DEVICE
+  digitalWrite(GPSpowerPin, HIGH);
+  Serial1.begin(9600);
+  delay(1000);
+
+  bool newData = false;
+  unsigned long chars;
+  unsigned short sentences, failed;
+  uint8_t gpsAttemptsCounter = 0;
+  uint8_t GPSattempts = 10;  //  How many times (Seconds) to try to connect to GPS
+  
+  Serial.println("[GPS] Searching...");
+
+  while(!GPStimeReceived && (gpsAttemptsCounter <= GPSattempts)){
+    // For one second we parse GPS data and report some key values
+    for (unsigned long start = millis(); millis() - start < 1000;)
+    {
+      while (Serial1.available())
+      {
+        char c = Serial1.read();
+        // Serial.write(c); // uncomment this line if you want to see the GPS data flowing
+        if (gps.encode(c)) // Did a new valid sentence come in?
+          newData = true;
+      }
+    }
+
+    if (newData)
+    {
+      unsigned long age; 
+      int GPSyear;
+      byte GPSmonth, GPSday, GPShour, GPSminute, GPSsecond, GPShundredths;
+      gps.f_get_position(&GPSlat, &GPSlon, &age);
+      Serial.print("LAT=");
+      Serial.print(GPSlat == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : GPSlat, 6);
+      Serial.print(" LON=");
+      Serial.print(GPSlon == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : GPSlon, 6);
+      Serial.print(" SAT=");
+      Serial.print(gps.satellites() == TinyGPS::GPS_INVALID_SATELLITES ? 0 : gps.satellites());
+      Serial.print(" PREC=");
+      Serial.print(gps.hdop() == TinyGPS::GPS_INVALID_HDOP ? 0 : gps.hdop());
+
+      gps.crack_datetime(&GPSyear, &GPSmonth, &GPSday, &GPShour, &GPSminute, &GPSsecond, &GPShundredths, &age);
+      Serial.print(" Year=");
+      Serial.print(GPSyear);
+      Serial.print(" month=");
+      Serial.print(GPSmonth);
+      Serial.print(" Day=");
+      Serial.print(GPSday);
+      Serial.print(" Hour=");
+      Serial.print(GPShour);
+      Serial.print(" Minute=");
+      Serial.print(GPSminute);
+      Serial.print(" Second=");
+      Serial.print(GPSsecond);
+
+      if(GPSyear > 2024){
+        rtc.setTime(GPShour, GPSminute, GPSsecond);
+        rtc.setDate(GPSday, GPSmonth, (GPSyear-2000));
+        GPStimeReceived = true;  //  Got our Date and Time
+      }
+
+    }
+    
+    unsigned short numberSats = gps.satellites();
+
+    gps.stats(&chars, &sentences, &failed);
+    Serial.print(" CHARS=");
+    Serial.print(chars);
+    Serial.print(" SENTENCES=");
+    Serial.print(sentences);
+    Serial.print(" CSUM ERR=");
+    Serial.print(failed);
+    Serial.print(" Sats=");
+    Serial.println(numberSats);
+    if (chars == 0)
+      Serial.println("** No characters received from GPS: check wiring **"); 
+
+    gpsAttemptsCounter++;
+  }
+    //TURN OFF GPS DEVICE
+    digitalWrite(GPSpowerPin, LOW);
+    if(GPStimeReceived){
+      return true;
+    }
+    else{
+      return false;
+    }
+}
+
 void writeSDcardLog(String dataString){
   String dataStringLog = "";
 
@@ -240,8 +342,9 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   int st = 0;
   unsigned long t0 = millis();
   Serial.println("[NET] NB.begin(PIN+APN)...");
-  Watchdog.enable(WDT_TIMEOUT_MS);
-  while(st != 3  || (millis() - t0 < beginDeadlineMs)){
+//  Watchdog.enable(WDT_TIMEOUT_MS);
+//  while(st != 3  || (millis() - t0 < beginDeadlineMs)){
+  while(millis() - t0 < beginDeadlineMs){
     st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apnUser.c_str(), settings.apnPass.c_str());
   }
   if(st == 3){
@@ -267,7 +370,7 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
       return false;
     }
     delay(500);
-    Watchdog.reset();
+//    Watchdog.reset();
   }
   if (!(lastReg == 1 || lastReg == 5)) {
     Serial.println("[NET] Registration timeout — no network attach");
@@ -282,7 +385,7 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   // --- Bring up PDP (get IP) with timed poll ---
   Serial.println("[NET] Starting PDP bring-up...");
   t0 = millis();
-  Watchdog.reset();
+//  Watchdog.reset();
   while (millis() - t0 < pdpDeadlineMs) {
     (void)gprs.attachGPRS();                 // quick nudge; harmless if already up
     IPAddress ip = gprs.getIPAddress();
@@ -292,7 +395,7 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
       Serial.print("[NET] PDP IP: "); Serial.println(ip);
       return true;
     }
-    Watchdog.disable();
+//    Watchdog.disable();
     delay(500);
   }
   // One clean refresh if PDP didn’t appear
@@ -657,6 +760,47 @@ void timeSyncTick() {
   }
 }
 
+void bootSequence(){
+  Serial.println("\n=== BOOT ===");
+  nbAttachAPN_Flag = nbAttachAPN();
+  if (!nbAttachAPN_Flag) {
+    Serial.println("[BOOT] Attach failed");
+    writeSDcardLog("[BOOT] Attach failed");
+    flashLED(5, 200);
+    return;
+  }
+
+  setupMqttClient();                       // your working helper
+  mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
+  if (!mqttConnectFlag) {
+    // one short PDP refresh + single retry
+    gprs.detachGPRS(); delay(600);
+    if (nbAttachAPN(20000, 20000, 20000)) {
+      mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
+    }
+    if(!mqttConnectFlag){
+      Serial.println("[MQQT] Connection failed");
+      writeSDcardLog("[MQQT] Connection failed");
+      flashLED(5, 200);
+    }
+  }
+
+/*
+  ntpUpdateFlag = timeSyncOnce();
+
+  if(ntpUpdateFlag == false){
+    writeSDcardLog("[NTP] NTP Clock Update Failed");
+    flashLED(10, 200);
+  }
+  if(nbAttachAPN_Flag == true && mqttConnectFlag == true && ntpUpdateFlag == true){
+    Serial.println("[BOOT] Connected.");
+    writeSDcardLog("[BOOT] Success");
+    flashLED(1, 2000);
+  }
+  */
+}
+
+
 void readBatteryVoltage() {
   int raw = analogRead(VBAT_PIN);   // 0–4095 for 12-bit ADC
   batteryVolts = (raw / 4095.0) * 3.3 * 2; // *2 because of onboard divider
@@ -749,11 +893,12 @@ void createAndSendJsonMsg(){
   String payload;
   payload.reserve(2048);
 
-  if (!useServerTimestamp) {
+  //if (!useServerTimestamp) {  //  Changed from NTP to GPS so changed flag
+    if (GPStimeReceived){
     // use device timestamp (array with ts + values)
-    uint32_t ts = rtc.getEpoch();     // seconds since 1970
+//    uint32_t ts = rtc.getEpoch();     // seconds since 1970
     if (settings.sensorsMode == 0) {
-      payload += "[{\"ts\":"; payload += ts; payload += "000";
+      payload += "[{\"ts\":"; payload += tsSendValue; payload += "000";
       payload += ",\"values\":{";
       payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
       payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
@@ -766,14 +911,14 @@ void createAndSendJsonMsg(){
       payload += "\"rain24hr\":";payload += rain24hrSendValue;
       payload += "}}]";
     } else if (settings.sensorsMode == 1) {
-      payload += "[{\"ts\":"; payload += ts; payload += "000";
+      payload += "[{\"ts\":"; payload += tsSendValue; payload += "000";
       payload += ",\"values\":{";
       payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
       payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
       payload += "\"rain24hr\":"; payload += rain24hrSendValue;
       payload += "}}]";
     } else { // 2
-      payload += "[{\"ts\":"; payload += ts; payload += "000";
+      payload += "[{\"ts\":"; payload += tsSendValue; payload += "000";
       payload += ",\"values\":{";
       payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
       payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; 
@@ -824,6 +969,29 @@ bool ok = publishTelemetryJSON(settings.tbTopicString.c_str(), payload);
   if (!ok) Serial.println("[PUB] Telemetry send failed");
 #endif
 }
+
+// Create Json message to send
+void createAndSendGPSJsonMsg(){
+  String payload;
+  payload.reserve(2048);
+
+  uint32_t ts = rtc.getEpoch();
+
+  payload += "[{\"ts\":"; payload += ts; payload += "000";
+  payload += ",\"values\":{";
+  payload += "\"GPSlat\":"; payload += String(GPSlat, 6); payload += ",";
+  payload += "\"GPSlon\":"; payload += String(GPSlon, 6);
+  payload += "}}]";
+
+
+  // Hardened publish you already added:
+bool ok = publishTelemetryJSON(settings.tbTopicString.c_str(), payload);
+#if ENABLE_DEBUG
+  Serial.print("Sent: "); Serial.println(payload);
+  if (!ok) Serial.println("[PUB] Telemetry send failed");
+#endif
+}
+
 // Create message to SD save
 String createSDcardPayloadHeader(){
   String payloadHeader;
@@ -1192,10 +1360,12 @@ void flashLED(uint8_t no_of_flashes, uint16_t delay_time)
 //  SETUP
 ///////////////////////////////////////////////////////////
 void setup() {
-  Watchdog.disable();   // make sure a previous run didn't leave it ticking
+//  Watchdog.disable();   // make sure a previous run didn't leave it ticking
   //Pins
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
+  pinMode(GPSpowerPin, OUTPUT);
+  digitalWrite(GPSpowerPin, LOW);
   // Rain input
   pinMode(PIN_RAIN, INPUT_PULLUP);
   LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
@@ -1235,45 +1405,17 @@ void setup() {
   rtc.enableAlarm(rtc.MATCH_SS);
   rtc.attachInterrupt(rtcWakeISR);
 
-  Serial.println("\n=== BOOT ===");
-  nbAttachAPN_Flag = nbAttachAPN();
-  if (!nbAttachAPN_Flag) {
-    Serial.println("[BOOT] Attach failed — not proceeding.");
-    writeSDcardLog("[BOOT] Attach failed — not proceeding");
-    flashLED(5, 200);
-    return;
-  }
+  gpsUpdateFlag = getGPSinfo();
+  bootSequence();
 
-setupMqttClient();                       // your working helper
-mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
-if (!mqttConnectFlag) {
-  // one short PDP refresh + single retry
-  gprs.detachGPRS(); delay(600);
-  if (nbAttachAPN(20000, 20000, 20000)) {
-    mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
-  }
-  if(!mqttConnectFlag){
-    Serial.println("[MQQT] Connection failed — not proceeding.");
-    writeSDcardLog("[MQQT] Connection failed — not proceeding.");
-    flashLED(5, 200);
-  }
-}
-
-  ntpUpdateFlag = timeSyncOnce();
-
-  if(ntpUpdateFlag == false){
-    writeSDcardLog("[NTP] NTP Clock Update Failed");
-    flashLED(10, 200);
-  }
-  if(nbAttachAPN_Flag == true && mqttConnectFlag == true && ntpUpdateFlag == true){
-    Serial.println("[BOOT] Connected.");
-    writeSDcardLog("[BOOT] Success");
-    flashLED(1, 2000);
-  }
   // Give the modem ~1s to flush
   unsigned long t1 = millis();
   while (millis() - t1 < 1000) { mqttClient.poll(); delay(20); }
-  
+
+  if(nbAttachAPN_Flag && mqttConnectFlag && gpsUpdateFlag){
+    createAndSendGPSJsonMsg();  // Send initial Date/Time, Latitude and Longditude data from GPS to TB
+  }
+
   // We’ll re-enable the watchdog inside loop() on each wake
   Watchdog.disable();
 
@@ -1285,9 +1427,9 @@ if (!mqttConnectFlag) {
 void loop()
 {
   // Enable watchdog while we are awake and doing work
-  Watchdog.enable(WDT_TIMEOUT_MS);
+//  Watchdog.enable(WDT_TIMEOUT_MS);
   mqttClient.poll(); // keepalive
-  Watchdog.reset();  // we’re alive here
+//  Watchdog.reset();  // we’re alive here
 
   if(rtcWakeFlag){  //  RTC Alarm (1min)
     tsSendValue = rtc.getEpoch();  //  Time for JsonMsg if needed
@@ -1314,12 +1456,22 @@ void loop()
         Serial.println("Modulus!");
       #endif
     }
-    //Increment currentSampleNo
+    //Increment currentSampleNo and GPS update counter
     currentSampleNo++;  // Increment sample counter
+    GPScounter++;
+
+    // Update GPS if counter time is up!
+    if(GPSupdateMins <= GPScounter){
+      gpsUpdateFlag = getGPSinfo();
+      if(gpsUpdateFlag){
+        createAndSendGPSJsonMsg();  // Send Date/Time, Latitude and Longditude data from GPS to TB
+      }
+      GPScounter = 0;
+    }
 
     resetAlarms();
     goToSleepFlag = true;
-    Watchdog.reset();   // finished handling the minute tick
+  //  Watchdog.reset();   // finished handling the minute tick
   }
 
   if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
@@ -1340,7 +1492,13 @@ void loop()
     sendMsgFlag = false;  //clear flag
     #if ENABLE_DEBUG
       Serial.println("sendMessage!");
-    #endif  
+    #endif 
+
+    if (!nbAttachAPN_Flag){
+      bootSequence(); //Try to connect again if boot failed
+      //recoverNetworkAndMqtt();
+    } 
+
     //  This is where we do the sample averaging and message creation!
     calcSamples(currentSampleNo);
     createAndSendJsonMsg(); 
@@ -1348,17 +1506,20 @@ void loop()
     //SD Card
     currentSDfilename = createSDfilename();
     if (currentSDfilename != previousSDfilename){  //New file so new header needed
-      writeSDcard(currentSDfilename, createSDcardPayloadHeader());  //  Write new header on new file
+      if(!SD.exists(currentSDfilename)){
+        Serial.println("[SD] New Header");
+        writeSDcard(currentSDfilename, createSDcardPayloadHeader());  //  Write new header on new file only
+      }
       previousSDfilename = currentSDfilename;  //  Update previous filename so we can move on...
     }
     writeSDcard(currentSDfilename, createSDcardPayload());  //  Write data
 
     // after publish + drain
-    if (!mqttClient.connected()) {
-      timeSyncTick();
-    }
+//    if (!mqttClient.connected()) {
+//      timeSyncTick();
+//    }
 
-    Watchdog.reset();   // we successfully made it through send & SD
+  //  Watchdog.reset();   // we successfully made it through send & SD
 
     flashLED(3, 100);
     //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
@@ -1375,8 +1536,9 @@ void loop()
     #endif
     goToSleepFlag = false;
 
+  //  Watchdog.reset();   // finished handling the minute tick  
     // Disable WDT while we’re sleeping for ~60s
-    Watchdog.disable();
+  //  Watchdog.disable();
     delay(100);
     LowPower.idle();
     //LowPower.deepSleep();

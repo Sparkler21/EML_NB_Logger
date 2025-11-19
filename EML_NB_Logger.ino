@@ -62,7 +62,7 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 
 /* Initialise Library instances */
 RTCZero rtc;
-GPRS gprs;
+//GPRS gprs;
 NB nbAccess;
 NBScanner scanner;
 NBClient nbClient;
@@ -116,6 +116,7 @@ bool nbAttachAPN_Flag = false;
 bool mqttConnectFlag = false;
 bool ntpUpdateFlag = false;
 bool gpsUpdateFlag = false;
+bool gpsRetryFlag = false;
 // --- Time sync state ---
 bool useServerTimestamp = true;                 // start with TB server time until we sync
 uint32_t nextTimeSyncMs = 0;                    // millis() when we may try again
@@ -230,7 +231,7 @@ bool getGPSinfo(){
   unsigned long chars;
   unsigned short sentences, failed;
   uint8_t gpsAttemptsCounter = 0;
-  uint8_t GPSattempts = 10;  //  How many times (Seconds) to try to connect to GPS
+  uint8_t GPSattempts = 100;  //  How many times (Seconds) to try to connect to GPS
   
   Serial.println("[GPS] Searching...");
 
@@ -344,9 +345,9 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   Serial.println("[NET] NB.begin(PIN+APN)...");
 //  Watchdog.enable(WDT_TIMEOUT_MS);
 //  while(st != 3  || (millis() - t0 < beginDeadlineMs)){
-  while(millis() - t0 < beginDeadlineMs){
+//  while(millis() - t0 < beginDeadlineMs){
     st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apnUser.c_str(), settings.apnPass.c_str());
-  }
+//  }
   if(st == 3){
     Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
   }
@@ -383,10 +384,10 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   }
   Serial.print("[NET] CSQ: "); Serial.println(scanner.getSignalStrength());
   // --- Bring up PDP (get IP) with timed poll ---
-  Serial.println("[NET] Starting PDP bring-up...");
-  t0 = millis();
+//  Serial.println("[NET] Starting PDP bring-up...");
+//  t0 = millis();
 //  Watchdog.reset();
-  while (millis() - t0 < pdpDeadlineMs) {
+/*  while (millis() - t0 < pdpDeadlineMs) {
     (void)gprs.attachGPRS();                 // quick nudge; harmless if already up
     IPAddress ip = gprs.getIPAddress();
     Serial.print("[NET] IP poll: "); Serial.println(ip);
@@ -397,12 +398,12 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
     }
 //    Watchdog.disable();
     delay(500);
-  }
+  }*/
   // One clean refresh if PDP didn’t appear
-  Serial.println("[NET] PDP timed out; refreshing modem once...");
-  nbAccess.shutdown(); delay(1500);
-  st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apnUser.c_str(), settings.apnPass.c_str());
-  Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
+//  Serial.println("[NET] PDP timed out; refreshing modem once...");
+//  nbAccess.shutdown(); delay(1500);
+//  st = nbAccess.begin(settings.pin.c_str(), settings.apn.c_str(), settings.apnUser.c_str(), settings.apnPass.c_str());
+//  Serial.print("[NET] NB.begin(APN) -> "); Serial.println(st);
 
   // Re-check registration briefly
   t0 = millis();
@@ -414,7 +415,7 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   }
 
   // Try PDP again (short window)
-  t0 = millis();
+/*  t0 = millis();
   while (millis() - t0 < 15000) {
     (void)gprs.attachGPRS();
     IPAddress ip = gprs.getIPAddress();
@@ -428,14 +429,14 @@ bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000
   }
 
   Serial.println("[NET] PDP attach failed after refresh");
-  return false;
+  return false;*/
 }
 
 bool recoverNetworkAndMqtt() {
   Serial.println(F("[NET] Recovery: NB + MQTT"));
 
-  gprs.detachGPRS();
-  delay(600);
+//  gprs.detachGPRS();
+//  delay(600);
 
   if (!nbAttachAPN(20000, 20000, 20000)) {
     Serial.println(F("[NET] nbAttachAPN() failed in recovery"));
@@ -774,7 +775,7 @@ void bootSequence(){
   mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
   if (!mqttConnectFlag) {
     // one short PDP refresh + single retry
-    gprs.detachGPRS(); delay(600);
+//    gprs.detachGPRS(); delay(600);
     if (nbAttachAPN(20000, 20000, 20000)) {
       mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
     }
@@ -803,7 +804,8 @@ void bootSequence(){
 
 void readBatteryVoltage() {
   int raw = analogRead(VBAT_PIN);   // 0–4095 for 12-bit ADC
-  batteryVolts = (raw / 4095.0) * 3.3 * 2; // *2 because of onboard divider
+  float v_adc = (raw / 4095.0) * 3.3; //
+  batteryVolts = v_adc * 3;  // Reverse the voltage divider (1.2 MOhm and 330 kOhm)
   #if ENABLE_DEBUG
     Serial.print("Battery Volts = "); Serial.println(batteryVolts);
   #endif
@@ -1406,6 +1408,7 @@ void setup() {
   rtc.attachInterrupt(rtcWakeISR);
 
   gpsUpdateFlag = getGPSinfo();
+  delay(5000);
   bootSequence();
 
   // Give the modem ~1s to flush
@@ -1414,6 +1417,9 @@ void setup() {
 
   if(nbAttachAPN_Flag && mqttConnectFlag && gpsUpdateFlag){
     createAndSendGPSJsonMsg();  // Send initial Date/Time, Latitude and Longditude data from GPS to TB
+  }
+  else{
+    gpsRetryFlag = true;
   }
 
   // We’ll re-enable the watchdog inside loop() on each wake
@@ -1461,10 +1467,12 @@ void loop()
     GPScounter++;
 
     // Update GPS if counter time is up!
-    if(GPSupdateMins <= GPScounter){
+    if((GPSupdateMins <= GPScounter) || gpsRetryFlag == true){
       gpsUpdateFlag = getGPSinfo();
       if(gpsUpdateFlag){
         createAndSendGPSJsonMsg();  // Send Date/Time, Latitude and Longditude data from GPS to TB
+        gpsUpdateFlag = false;
+        gpsRetryFlag = false;
       }
       GPScounter = 0;
     }
@@ -1540,8 +1548,9 @@ void loop()
     // Disable WDT while we’re sleeping for ~60s
   //  Watchdog.disable();
     delay(100);
-    LowPower.idle();
-    //LowPower.deepSleep();
+  //  LowPower.idle();
+    LowPower.deepSleep();
+  //  LowPower.sleep();
   }
 }
 

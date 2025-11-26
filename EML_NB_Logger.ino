@@ -123,7 +123,7 @@ uint32_t nextTimeSyncMs = 0;                    // millis() when we may try agai
 uint32_t timeSyncBackoffMs = 5UL*60UL*1000UL;   // start with 5 minutes
 // Pins
 const int PIN_RAIN = 7;  // contact-closure input (to GND)
-const int PIN_RL_EN = 6;  // River Level Enable
+const int PIN_RL_EN = 3;  // River Level Enable
 const int GPSpowerPin = 0;
 // Globals
 volatile uint32_t rainTipsCounter = 0;
@@ -805,7 +805,7 @@ void bootSequence(){
 void readBatteryVoltage() {
   int raw = analogRead(VBAT_PIN);   // 0–4095 for 12-bit ADC
   float v_adc = (raw / 4095.0) * 3.3; //
-  batteryVolts = v_adc * 3;  // Reverse the voltage divider (1.2 MOhm and 330 kOhm)
+  batteryVolts = v_adc * 3.64;  // Reverse the voltage divider (1.2 MOhm and 330 kOhm)
   #if ENABLE_DEBUG
     Serial.print("Battery Volts = "); Serial.println(batteryVolts);
   #endif
@@ -1407,9 +1407,9 @@ void setup() {
   rtc.enableAlarm(rtc.MATCH_SS);
   rtc.attachInterrupt(rtcWakeISR);
 
-  gpsUpdateFlag = getGPSinfo();
-  delay(5000);
   bootSequence();
+  delay(3000);
+  gpsUpdateFlag = getGPSinfo();
 
   // Give the modem ~1s to flush
   unsigned long t1 = millis();
@@ -1544,6 +1544,16 @@ void loop()
     #endif
     goToSleepFlag = false;
 
+
+    // Put peripherals into low-power before sleeping
+    Serial1.end();        // GPS UART
+
+    // SD card: release bus & CS
+    SD.end();
+    pinMode(SDchipSelect, INPUT_PULLUP);
+
+    // Make sure GPS is off (you already do it in getGPSinfo(), but belt & braces)
+    digitalWrite(GPSpowerPin, LOW);
   //  Watchdog.reset();   // finished handling the minute tick  
     // Disable WDT while we’re sleeping for ~60s
   //  Watchdog.disable();

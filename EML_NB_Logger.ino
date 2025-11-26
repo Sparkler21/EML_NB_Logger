@@ -123,7 +123,7 @@ uint32_t nextTimeSyncMs = 0;                    // millis() when we may try agai
 uint32_t timeSyncBackoffMs = 5UL*60UL*1000UL;   // start with 5 minutes
 // Pins
 const int PIN_RAIN = 7;  // contact-closure input (to GND)
-const int PIN_RL_EN = 3;  // River Level Enable
+const int PIN_RL_EN = 6;  // River Level Enable
 const int GPSpowerPin = 0;
 // Globals
 volatile uint32_t rainTipsCounter = 0;
@@ -164,39 +164,10 @@ bool GPStimeReceived = false;
 void forceReboot(const char* reason);
 bool recoverNetworkAndMqtt();
 void bootSequence();
-void modemSleep();
-bool modemWake();
-bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000, uint32_t pdpDeadlineMs = 30000);
 
 ///////////////////////////////////////////////////////////
 //  Helper Functions
 ///////////////////////////////////////////////////////////
-void modemSleep() {
-  Serial.println(F("[NET] Modem sleep (shutdown)"));
-  // Tear down MQTT cleanly if connected
-  if (mqttClient.connected()) {
-    mqttClient.stop();
-  }
-  // Power down SARA-R4
-  nbAccess.shutdown();
-}
-
-bool modemWake() {
-  Serial.println(F("[NET] Modem wake"));
-  nbAttachAPN_Flag = nbAttachAPN();       // your existing helper
-  if (!nbAttachAPN_Flag) {
-    Serial.println(F("[NET] Wake failed (attach)"));
-    return false;
-  }
-
-  setupMqttClient();                      // your existing helper
-  // You may want to reconnect MQTT here if not already connected
-  mqttConnectFlag = mqttClient.connect(settings.tbHostString.c_str(),
-                                       settings.tbPortInt);
-  return mqttConnectFlag;
-}
-
-
 void resetAlarms(){
     rtc.setAlarmSeconds(settings.rtcAlarmSecond);
     rtc.enableAlarm(rtc.MATCH_SS);
@@ -368,7 +339,7 @@ void forceReboot(const char* reason) {
   NVIC_SystemReset();  // SAMD21 full reset
 }
 
-bool nbAttachAPN(uint32_t beginDeadlineMs, uint32_t regDeadlineMs, uint32_t pdpDeadlineMs) {
+bool nbAttachAPN(uint32_t beginDeadlineMs = 5000, uint32_t regDeadlineMs = 45000, uint32_t pdpDeadlineMs = 30000) {
   int st = 0;
   unsigned long t0 = millis();
   Serial.println("[NET] NB.begin(PIN+APN)...");
@@ -1451,23 +1422,6 @@ void setup() {
     gpsRetryFlag = true;
   }
 
-  // ------------------------------------------
-  // Prevent floating pins – reduce sleep current
-  // ------------------------------------------
-
-  // List of *unused* pins on your design.
-  // Change this list to suit your wiring!
-  const int unusedPins[] = {
-    A1, A3, A4, A5, A6   // ADC pins usually unused
-  };
-
-  // Configure unused pins
-  for (int i = 0; i < (sizeof(unusedPins) / sizeof(unusedPins[0])); i++) {
-    pinMode(unusedPins[i], INPUT_PULLUP);
-  }
-
-  // ------------------------------------------
-
   // We’ll re-enable the watchdog inside loop() on each wake
   Watchdog.disable();
 
@@ -1542,87 +1496,62 @@ void loop()
     }
   }
 
-if (sendMsgFlag) {  //  Send Message
-  sendMsgFlag = false;  // clear flag
+  if(sendMsgFlag){  //  Send Message
+    sendMsgFlag = false;  //clear flag
+    #if ENABLE_DEBUG
+      Serial.println("sendMessage!");
+    #endif 
 
-  #if ENABLE_DEBUG
-    Serial.println("sendMessage!");
-  #endif
+    if (!nbAttachAPN_Flag){
+      bootSequence(); //Try to connect again if boot failed
+      //recoverNetworkAndMqtt();
+    } 
 
-  bool modemReady = true;
-
-  // Wake modem / reconnect only when we actually need to send
-  if (!nbAttachAPN_Flag || !mqttClient.connected()) {
-    if (!modemWake()) {
-      // Couldn’t wake network – log and just go back to sleep
-      writeSDcardLog("[NET] modemWake() failed before send");
-      goToSleepFlag = true;
-      resetAlarms();
-      modemSleep();       // ensure modem is powered down
-      modemReady = false;
-    }
-  }
-
-  if (modemReady) {
-    //  This is where we do the sample averaging and message creation
+    //  This is where we do the sample averaging and message creation!
     calcSamples(currentSampleNo);
-    createAndSendJsonMsg();
+    createAndSendJsonMsg(); 
 
-    // SD Card
+    //SD Card
     currentSDfilename = createSDfilename();
-    if (currentSDfilename != previousSDfilename) {
-      // New file so new header needed
-      if (!SD.exists(currentSDfilename)) {
+    if (currentSDfilename != previousSDfilename){  //New file so new header needed
+      if(!SD.exists(currentSDfilename)){
         Serial.println("[SD] New Header");
-        writeSDcard(currentSDfilename, createSDcardPayloadHeader());
+        writeSDcard(currentSDfilename, createSDcardPayloadHeader());  //  Write new header on new file only
       }
-      previousSDfilename = currentSDfilename;
+      previousSDfilename = currentSDfilename;  //  Update previous filename so we can move on...
     }
     writeSDcard(currentSDfilename, createSDcardPayload());  //  Write data
 
-    flashLED(3, 100);
+    // after publish + drain
+//    if (!mqttClient.connected()) {
+//      timeSyncTick();
+//    }
 
-    // If this is midnight we need to clear the 24hr counter
-    if (sampleHour == 23 && sampleMinute == 59) {
+  //  Watchdog.reset();   // we successfully made it through send & SD
+
+    flashLED(3, 100);
+    //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
+    if(sampleHour == 23 && sampleMinute == 59){
       rain24hrTipsCounter = 0;
     }
-
-    // Finished sending; power down the modem until the next send
-    modemSleep();
   }
-}
 
-
-  //Sleep
-  if (goToSleepFlag) {
+  // Sleep!
+  if(goToSleepFlag){
     #if ENABLE_DEBUG
       Serial.println("Sleep!");
       delay(100);
     #endif
-
     goToSleepFlag = false;
 
-    // Make sure the user LED is definitely OFF during sleep
-    digitalWrite(LED_BUILTIN, LOW);
-    pinMode(LED_BUILTIN, OUTPUT);
-
-    // SD Card - minimise leakage: CS high and bus released
-    digitalWrite(SDchipSelect, HIGH);
-    pinMode(SDchipSelect, OUTPUT);
-
-    // Optional: end SPI to SD to reduce leakage through the bus
-    SPI.end();
-
-    delay(20);
+  //  Watchdog.reset();   // finished handling the minute tick  
+    // Disable WDT while we’re sleeping for ~60s
+  //  Watchdog.disable();
+    delay(100);
+  //  LowPower.idle();
     LowPower.deepSleep();
-
-    // ---- we resume here after wake ----
-    // Restore LED pin configuration (keep it off until we need it)
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);
+  //  LowPower.sleep();
   }
-
-
 }
 
 ///////////////////////////////////////////////////////////

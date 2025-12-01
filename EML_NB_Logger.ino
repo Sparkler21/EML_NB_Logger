@@ -54,7 +54,7 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
  * Enables debug support. To disable this feature set to 0.
  ***********************************************************/
 #define ENABLE_DEBUG          1
-#define VBAT_PIN              A6
+//#define VBAT_PIN              A6
 #define DEFAULT_INT_VALUE     0
 #define DEFAULT_BOOL_VALUE    false
 #define DEFAULT_STRING_VALUE  "default"
@@ -792,7 +792,7 @@ void bootSequence(){
   if(ntpUpdateFlag == false){
     writeSDcardLog("[NTP] NTP Clock Update Failed");
     flashLED(10, 200);
-  }
+  }readBatteryVoltageanalogReadResolution(12)
   if(nbAttachAPN_Flag == true && mqttConnectFlag == true && ntpUpdateFlag == true){
     Serial.println("[BOOT] Connected.");
     writeSDcardLog("[BOOT] Success");
@@ -803,9 +803,16 @@ void bootSequence(){
 
 
 void readBatteryVoltage() {
-  int raw = analogRead(VBAT_PIN);   // 0–4095 for 12-bit ADC
-  float v_adc = (raw / 4095.0) * 3.3; //
-  batteryVolts = v_adc * 3.64;  // Reverse the voltage divider (1.2 MOhm and 330 kOhm)
+  float v_adc = 0.0;
+  uint32_t adc = 0;
+  const int N = 10;
+
+  for (int i = 0; i < N; i++) {
+    adc = adc + analogRead(ADC_BATTERY);   // 0–4095 for 12-bit ADC
+    delay(50); // small delay between samples
+  }
+  v_adc = ((adc/N) / 4095.0) * 3.3f; //
+  batteryVolts = v_adc * 1.275f;  // Reverse the voltage divider (1.2 MOhm and 330 kOhm)
   #if ENABLE_DEBUG
     Serial.print("Battery Volts = "); Serial.println(batteryVolts);
   #endif
@@ -1373,6 +1380,7 @@ void setup() {
   LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
   
   analogReadResolution(12);
+  analogReference(AR_DEFAULT);  // 3.3 V ref (default), explicit for clarity
 
   //Serial Comms
   Serial.begin(115200);

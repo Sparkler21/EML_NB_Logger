@@ -1,10 +1,10 @@
-# Configuration file for EML NB Logger
+# Configuration file for EML NB Logger (HPT02 - Coalburn)
 
 # Serial Number
-serialNo = 212702
+serialNo = 259993
 
 # Device ID
-deviceID = HPT01
+deviceID = HPT03
 
 # APN
 apn = gigsky-02
@@ -16,10 +16,10 @@ pin =
 tbHostString = mqtt.eu.thingsboard.cloud
 tbPortInt = 1883
 tbTopicString = v1/devices/me/telemetry
-tbTokenString = uo423fza9leqz4pry7cb
+tbTokenString = PcZ31IlOTOh3wTKKcLBD
 
 # sensorsMode -  0 = Rain and River Level, 1 = Rain only, 2 = River Level only
-sensorsMode = 0
+sensorsMode = 2
 
 # rtcAlarmSecond - The second the alarm is triggered
 rtcAlarmSecond = 58

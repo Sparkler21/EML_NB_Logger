@@ -1,0 +1,34 @@
+# Configuration file for EML NB Logger (HPT02 - Catchburn)
+
+# Serial Number
+serialNo = 259992
+
+# Device ID
+deviceID = HPT02
+
+# APN
+apn = gigsky-02
+apnUser =
+apnPass =
+pin =
+
+#ThingsBoard
+tbHostString = mqtt.eu.thingsboard.cloud
+tbPortInt = 1883
+tbTopicString = v1/devices/me/telemetry
+tbTokenString = vxl9ZxrJ5J6soedld65D
+
+# sensorsMode -  0 = Rain and River Level, 1 = Rain only, 2 = River Level only
+sensorsMode = 2
+
+# rtcAlarmSecond - The second the alarm is triggered
+rtcAlarmSecond = 58
+
+# samplingInterval - In minutes
+samplingInterval = 10
+
+# riverLevelRange - Max range in cm
+riverLevelRange = 600
+
+# rainGaugeCF - Rain gauge calibration factor
+rainGaugeCF = 0.200

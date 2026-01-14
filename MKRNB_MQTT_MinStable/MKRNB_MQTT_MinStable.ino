@@ -158,6 +158,7 @@ static bool ensureRegisteredWithKicks(uint32_t regTimeoutMs) {
 }
 
 static bool attachPdpWithApn(const char* apn, uint32_t ipTimeoutMs) {
+  bool ip_done = false;
   Serial.print("[NET] Trying APN: "); Serial.println(apn);
 
   // Clean socket state first
@@ -183,13 +184,14 @@ static bool attachPdpWithApn(const char* apn, uint32_t ipTimeoutMs) {
   Serial.print("[NET] attachGPRS -> "); Serial.println((int)st);
 
   uint32_t t0 = millis();
-  while (millis() - t0 < ipTimeoutMs) {
+  while (millis() - t0 < ipTimeoutMs || ip_done == true) {
     wdtFeed();  // <<< WDT FEED HERE (can run up to 30s)
     IPAddress ip = gprs.getIPAddress();
     if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
       Serial.print("[NET] IP: "); Serial.println(ip);
       Serial.println(saraAT("AT+CGATT?", 2000));
       Serial.println(saraAT("AT+CGPADDR=1", 3000));
+      ip_done = true;
       return true;
     }
     delay(500);
@@ -423,16 +425,22 @@ void setup() {
 
   rtc.begin();
 
-  waitSimAndModemReady(15000);   // 15s on cold boot is reasonable
-  Serial.println("[NET] nbAccess.begin()...");
+//  waitSimAndModemReady(15000);   // 15s on cold boot is reasonable
+  Serial.println("[NET] nbAccess.begin()...");            //char : 0 if asynchronous. If synchronous, returns status : 0=ERROR, 1=IDLE, 2=CONNECTING, 3=NB_READY, 4=GPRS_READY, 5=TRANSPARENT_CONNECTED
   int bs = nbAccess.begin();
   Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
 
-  // IMPORTANT: do NOT call nbAccess.begin() again per-APN
-  if (!bringUpNetworkStable()) {
-    Serial.println("[BOOT] Network failed");
-    // sleep path...
+
+  if(bs == 0){  //Reboot and try again
+    Watchdog.enable(1000);
   }
+
+
+  // IMPORTANT: do NOT call nbAccess.begin() again per-APN
+//  if (!bringUpNetworkStable()) {
+//    Serial.println("[BOOT] Network failed");
+//    // sleep path...
+//  }
 
   // after PDP is up, before MQTT
   delay(5000);                   // let routing/NAT settle

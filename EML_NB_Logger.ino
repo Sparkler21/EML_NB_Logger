@@ -4,6 +4,24 @@
   - Rain gauge on D7 (contact to GND), debounced in ISR
   - Sample every 60 s, publish every 10 min
 
+PINS:
+D0 = GPS Power Pin
+D1 = LED EXT
+D2 = 
+D3 = River Level Enable
+D4 = SD Chip Select
+D5 = Flash Chip Select
+D6 =
+D7 = Rain Gauge Input
+D8 = MOSI
+D9 = SCK
+D10 = MISO
+D11 = SDA
+D12 = SCL
+D13 = ->Rx
+D14 = <-Tx
+A2 = River Level Input
+
 Notes on Ultrasonic Level Sensor:  XL-MaxSonar-WR/WRC Pin Out 
 
 Pin 1- Leave open (or high) for serial output on the Pin 5 output. When Pin 1 is held low the Pin 5 output sends a pulse 
@@ -116,6 +134,7 @@ static const uint32_t SLEEP_SECONDS = 60;
 
 float riverLevelRange_float;
 float rainGaugeCF_float;
+const int LED_Ext = 1;
 const int SDchipSelect = 4;
 const int FLASHchipSelect = 5;
 const String logFile = "log.txt";
@@ -224,8 +243,8 @@ static void wdtDoneLongOp() {
 }
 
 // -------------------- LED helpers --------------------
-static void ledOff() { digitalWrite(LED_BUILTIN, LOW); }
-static void ledOn()  { digitalWrite(LED_BUILTIN, HIGH); }
+static void ledOff() { digitalWrite(LED_Ext, LOW); }
+static void ledOn()  { digitalWrite(LED_Ext, HIGH); }
 static void ledBlink(uint8_t n, uint16_t onMs = 80, uint16_t offMs = 140) {
   for (uint8_t i = 0; i < n; i++) { ledOn(); delay(onMs); ledOff(); delay(offMs); }
 }
@@ -466,7 +485,6 @@ static bool mqttConnectOnce() {
     return false;
   }
   Serial.println("[MQTT] Connected");
-  stage(5);
   return true;
 }
 
@@ -498,7 +516,6 @@ static bool mqttConnectWithRetries(int attempts) {
 
     if (ok) {
       Serial.println("[MQTT] Connected");
-      stage(5);
       return true;
     }
 
@@ -564,8 +581,6 @@ static void modemPowerDown() {
   Serial.println("[PWR] nbAccess.shutdown()");
   nbAccess.shutdown();
   delay(500);
-
-  stage(7);
 }
 
 
@@ -624,7 +639,6 @@ static bool attachWithApn(const String& apn, uint32_t ipWaitMs = 20000) {
     if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
       Serial.print("[NET] IP acquired: ");
       Serial.println(ip);
-      ledBlink(5);   // PDP/IP OK
       Serial.println(saraAT("AT+CGATT?", 2000));
       Serial.println(saraAT("AT+CGPADDR=1", 3000));
       return true;
@@ -761,6 +775,7 @@ bool getGPSinfo(){
     // For one second we parse GPS data and report some key values
     for (unsigned long start = millis(); millis() - start < 1000;)
     {
+      ledBlink(1);
       while (Serial1.available())
       {
         char c = Serial1.read();
@@ -828,11 +843,11 @@ bool getGPSinfo(){
     // Cleanly stop GPS UART to avoid any lingering serial activity
     Serial1.end();
     if(GPStimeReceived){
-//      ledLong(2);    // GPS fix/time OK
+
       return true;
     }
     else{
-      ledBlink(2);   // GPS fail
+
       return false;
     }
 }
@@ -1923,18 +1938,16 @@ void serialPrintSettings()
 ///////////////////////////////////////////////////////////
 void setup() {
   //Pins
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);  //  Put LED On to signal booting up.
+  pinMode(LED_Ext, OUTPUT);
   pinMode(GPSpowerPin, OUTPUT);
   digitalWrite(GPSpowerPin, LOW);
-  // Rain input
-  pinMode(PIN_RAIN, INPUT_PULLUP);
+  pinMode(PIN_RAIN, INPUT_PULLUP);  // Rain input
   LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
   
   analogReadResolution(12);
   analogReference(AR_DEFAULT);  // 3.3 V ref (default), explicit for clarity
 
-  ledOn();
+  ledOn();//  Put LED On to signal booting up.
 
   Serial.begin(115200);
   unsigned long t0 = millis();
@@ -1947,17 +1960,12 @@ void setup() {
   {
     Serial.println("Get Settings - Success");
     serialPrintSettings();  //  Print configs to screen
-    ledBlink(1);   // SD OK
   }
   else
   {
     Serial.println("Get Settings - Failed");
     writeSDcardLog("[SD] Get Settings - Failed");
   }
-
-  //Intialise limits from uploaded settings
-  riverLevelMin = riverLevelRange_float;
-  riverLevelMinSendValue = riverLevelRange_float;
 
   // RTC Setup
   rtc.begin(); // initialize RTC 24H format
@@ -1966,32 +1974,30 @@ void setup() {
   rtc.enableAlarm(rtc.MATCH_SS);
   rtc.attachInterrupt(rtcWakeISR);
 
-  stage(1);
-
+  //Intialise limits from uploaded settings
+  riverLevelMin = riverLevelRange_float;
+  riverLevelMinSendValue = riverLevelRange_float;
+  ledOff();//  Put LED Off to signal start of connection
   delay(3000);
-  gpsUpdateFlag = getGPSinfo();
 
-//  waitSimAndModemReady(15000);   // 15s on cold boot is reasonable
   Serial.println("[NET] nbAccess.begin()...");            //char : 0 if asynchronous. If synchronous, returns status : 0=ERROR, 1=IDLE, 2=CONNECTING, 3=NB_READY, 4=GPRS_READY, 5=TRANSPARENT_CONNECTED
   int bs = nbAccess.begin();
   Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
-
 
   if(bs == 0){  //Reboot and try again
     Watchdog.enable(1000);
   }
 
+  stage(1);  //  nbAccess complete, now GPS
 
-  // IMPORTANT: do NOT call nbAccess.begin() again per-APN
-//  if (!bringUpNetworkStable()) {
-//    Serial.println("[BOOT] Network failed");
-//    // sleep path...
-//  }
+  gpsUpdateFlag = getGPSinfo();  //  Flash LED during this
 
   // after PDP is up, before MQTT
   delay(5000);                   // let routing/NAT settle
   saraAT("AT+CGATT?", 2000);      // quick sanity
   saraAT("AT+CGPADDR=1", 3000);   // quick sanity
+
+  stage(2);  //  GPS Complete, Now MQTT
 
   nbClient.setTimeout(8000);
 
@@ -2005,19 +2011,21 @@ void setup() {
 
     if (!mqttConnectWithRetries(2)) {
       Serial.println("[BOOT] MQTT failed");
-      stage(9);
+
 //      modemPowerDown();
-      ledOff();
 //      LowPower.deepSleep(SLEEP_SECONDS * 1000);
     }
   }
 
+  stage(3);  //  MQTT Complete, now send initial GPS message
 
 //  if(nbAttachAPN_Flag && mqttConnectFlag && gpsUpdateFlag){
       #if ENABLE_DEBUG
         Serial.println("createAndSendGPSJsonMsg");
       #endif
     createAndSendGPSJsonMsg();  // Send initial Date/Time, Latitude and Longditude data from GPS to TB
+
+      stage(4);  //  send initial GPS message complete, now loop
 //  }
 //  else{
 //    gpsRetryFlag = true;
@@ -2043,7 +2051,6 @@ void setup() {
   }
 
 //  modemPowerDown();
-  ledOff();
 //  Serial.println("[SLEEP] deepSleep");
   delay(50);
 //  LowPower.deepSleep(SLEEP_SECONDS * 1000);
@@ -2055,8 +2062,8 @@ void setup() {
 /*void setup() {
 //  Watchdog.disable();   // make sure a previous run didn't leave it ticking
   //Pins
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);  //  Put LED On to signal booting up.
+  pinMode(LED_Ext, OUTPUT);
+  digitalWrite(LED_Ext, HIGH);  //  Put LED On to signal booting up.
   pinMode(GPSpowerPin, OUTPUT);
   digitalWrite(GPSpowerPin, LOW);
   // Rain input
@@ -2195,7 +2202,7 @@ void loop()
       }
       GPScounter = 0;
     }
-
+    ledBlink(1);
     resetAlarms();
     goToSleepFlag = true;
   //  Watchdog.reset();   // finished handling the minute tick
@@ -2215,15 +2222,16 @@ void loop()
   }
 
   if(sendMsgFlag){  //  Send Message
+    ledBlink(3);
     sendMsgFlag = false;  //clear flag
     #if ENABLE_DEBUG
       Serial.println("sendMessage!");
     #endif 
 
-    if (!nbAttachAPN_Flag){
-      bootSequence(); //Try to connect again if boot failed
-      //recoverNetworkAndMqtt();
-    } 
+//    if (!nbAttachAPN_Flag){
+//      bootSequence(); //Try to connect again if boot failed
+//      //recoverNetworkAndMqtt();
+//    } 
 
     //  This is where we do the sample averaging and message creation!
     calcSamples(currentSampleNo);
@@ -2277,7 +2285,7 @@ void loop()
 
     delay(100);
   //  LowPower.idle();
-    digitalWrite(LED_BUILTIN, LOW);  //  Turn LED off.
+//    digitalWrite(LED_Ext, LOW);  //  Turn LED off.
 //    mqttClient.stop();
 //    nbClient.stop();
     delay(100);

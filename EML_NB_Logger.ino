@@ -116,12 +116,6 @@ struct parameters {
 } settings;
 
 // -------------------- New Settings --------------------
-//static const char* TB_HOST  = "mqtt.eu.thingsboard.cloud";
-//static const int   TB_PORT  = 1883;
-//static const char* TB_TOPIC = "v1/devices/me/telemetry";
-//static const char* TB_TOKEN = "vxl9ZxrJ5J6soedld65D";
-//static const char* DEVICE_ID = "HPT02";
-
 static const char* APNS[] = { "gigsky-02", "flolive.net", "ukapn" };
 static const int APN_COUNT = sizeof(APNS) / sizeof(APNS[0]);
 
@@ -199,13 +193,9 @@ uint8_t sampleSecond;
 
 float GPSlat;  // GPS Latitude
 float GPSlon;  // GPS Longditude
-uint16_t GPSupdateMins = 1440;  //  To set the number on minutes to elapse before updating GPS Date/Time/Location.
+uint16_t GPSupdateMins = 10080;  //  To set the number on minutes to elapse before updating GPS Date/Time/Location.  Currently weekly.
 uint16_t GPScounter = 0;
 bool GPStimeReceived = false;
-
-void forceReboot(const char* reason);
-bool recoverNetworkAndMqtt();
-void bootSequence();
 
 ///////////////////////////////////////////////////////////
 //  NEW HELPERS
@@ -701,7 +691,16 @@ static void modemPowerDownForSleep(bool printDiag = true) {
   Serial.println("[PWR] Modem is down");
 }
 
+static void prepareForSleep() {
+  // Kill LED
+  ledOff();
 
+  // Put modem into lowest state you can (PDP down + RF off + shutdown)
+  modemPowerDownForSleep(false);
+
+  // Optional: stop Serial USB to reduce a little (if you can live without USB logs)
+  // Serial.end();
+}
 
 
 void resetAlarms(){
@@ -872,207 +871,8 @@ void writeSDcardLog(String dataString){
   writeSDcard(logFile, dataStringLog);
 }
 
-void forceReboot(const char* reason) {
-  Serial.print("[REBOOT] ");
-  Serial.println(reason);
-  writeSDcardLog(String("[REBOOT] ") + reason);
-  delay(200);  // let serial/SD flush
-  NVIC_SystemReset();  // SAMD21 full reset
-}
-
-bool nbAttachAPN(uint32_t regDeadlineMs = 45000, uint32_t pdpDeadlineMs = 30000) {
-
-if (!saraPing()) {
-  Serial.println("[NET] SerialSARA not responding; toggling CFUN...");
-  saraAT("AT+CFUN=0", 8000);
-  delay(500);
-  saraAT("AT+CFUN=1", 8000);
-  delay(1500);
-}
-
-Serial.println("[NET] Ensuring modem is registered (AT+CEREG?)...");
-
-unsigned long t0 = millis();
-bool regOK = false;
-
-while (millis() - t0 < regDeadlineMs) {
-  String r = saraAT("AT+CEREG?", 2000);
-  int stat = parseCeregStat(r);
-  Serial.print("[NET] ");
-  Serial.println(r);
-  if (stat == 1 || stat == 5) { regOK = true; break; }
-  if (stat == 3) { Serial.println("[NET] Registration denied"); return false; }
-  delay(1500);
-}
-
-if (!regOK) {
-  Serial.println("[NET] Registration timeout (AT+CEREG?)");
-  return false;
-}
-
-  // Signal check (non-blocking)
-  unsigned long csqStart = millis();
-  String csq = scanner.getSignalStrength();
-  while (csq == "99" && (millis() - csqStart) < 15000UL) {
-    delay(250);
-    csq = scanner.getSignalStrength();
-  }
-  Serial.print("[NET] CSQ: ");
-  Serial.println(csq);
-
-  // Try APNs in order: SD first, then provider-recommended fallbacks
-  const uint32_t ipWait = pdpDeadlineMs;
-bool ok = false;
-
-if (settings.apn.length() > 0) {
-  ok = attachWithApn(settings.apn, ipWait);
-}
-if (!ok && settings.apn != "flolive.net") {
-  ok = attachWithApn("flolive.net", ipWait);
-}
-if (!ok && settings.apn != "gigsky-02") {
-  ok = attachWithApn("gigsky-02", ipWait);
-}
-if (!ok && settings.apn != "ukapn") {
-  ok = attachWithApn("ukapn", ipWait);
-}
-
-if (ok) return true;
-
-Serial.println("[NET] PDP/IP timeout on all APNs");
-return false;
-
-}
-
-
-bool recoverNetworkAndMqtt() {
-  Serial.println(F("[NET] Recovery: NB + MQTT"));
-
-//  gprs.detachGPRS();
-//  delay(600);
-
-  if (!nbAttachAPN(20000, 20000)) {
-    Serial.println(F("[NET] nbAttachAPN() failed in recovery"));
-    netRecoverFailures++;
-    if (netRecoverFailures >= NET_RECOVER_REBOOT_LIMIT) {
-      forceReboot("[NET] nbAttachAPN() failed repeatedly");
-    }
-    return false;
-  }
-
-  if (!ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt)) {
-    Serial.println(F("[NET] MQTT connect failed in recovery"));
-    netRecoverFailures++;
-    if (netRecoverFailures >= NET_RECOVER_REBOOT_LIMIT) {
-      forceReboot("[NET] MQTT connect failed repeatedly");
-    }
-    return false;
-  }
-
-  // Success – clear error counter
-  netRecoverFailures = 0;
-  Serial.println(F("[NET] Recovery successful"));
-  return true;
-}
-
-
-void printMqttErr(int e) {
-  Serial.print("[MQTT] connectError="); Serial.println(e);
-  switch (e) {
-    case -1: Serial.println("[MQTT] Timeout waiting for CONNACK"); break;
-    case -2: Serial.println("[MQTT] TCP connect failed (PDP/DNS/firewall)"); break;
-    case -3: Serial.println("[MQTT] Protocol/broker rejected"); break;
-    case -4: Serial.println("[MQTT] Auth/token rejected (check device token)"); break;
-    default: Serial.println("[MQTT] Unknown error"); break;
-  }
-}
-
-// --- MQTT helpers ---
-void setupMqttClient() {
-  String cid = settings.deviceID + "-" + String((uint32_t)millis(), HEX);
-  mqttClient.setId(cid);
-
-  mqttClient.setUsernamePassword(settings.tbTokenString.c_str(), "");
-  mqttClient.setKeepAliveInterval(45 * 1000);
-
-  static bool willSet = false;
-  if (!willSet) {
-    mqttClient.beginWill("v1/devices/me/attributes", false, 0);
-    mqttClient.print("{\"status\":\"offline\"}");
-    mqttClient.endWill();
-    willSet = true;
-  }
-}
-
-
-bool ensureMqttConnected(const char* host, int port) {
-  if (mqttClient.connected()) return true;
-
-  // Hard reset client/socket state (fast)
-  mqttClient.stop();
-  nbClient.stop();
-  delay(200);
-
-  setupMqttClient();  // re-apply clientId/token/will
-
-  // Preflight TCP using the SAME nbClient MQTT uses
-  Serial.print("[MQTT] TCP preflight (nbClient)... ");
-  nbClient.stop();
-  delay(50);
-
-  if (!nbClient.connect(host, port)) {
-    Serial.println("FAIL");
-    nbClient.stop();
-    return false;     // fail fast (caller will sleep)
-  }
-  Serial.println("OK");
-  nbClient.stop();
-  delay(80);
-
-  // Optional: close a few stale sockets (helps after bad wakes)
-  saraAT("AT+USOCL=0", 1200);
-  saraAT("AT+USOCL=1", 1200);
-  saraAT("AT+USOCL=2", 1200);
-  saraAT("AT+USOCL=3", 1200);
-  delay(30);
-
-  Serial.print("[MQTT] Connecting to "); Serial.print(host); Serial.print(":"); Serial.println(port);
-
-  // IMPORTANT for Option A:
-  // Do NOT arm watchdog here. If connect hangs, WDT would reboot (which you don’t want).
-  bool ok = mqttClient.connect(host, port);
-
-  if (ok) {
-    Serial.println("[MQTT] Connected.");
-    unsigned long t0 = millis();
-    while (millis() - t0 < 400) { mqttClient.poll(); delay(20); }
-    return true;
-  }
-
-  Serial.print("[MQTT] connectError="); Serial.println(mqttClient.connectError());
-  mqttClient.stop();
-  nbClient.stop();
-  delay(200);
-  return false;
-}
-
-
-
-
-
-
-
 bool publishTelemetryJSON(const char* topic, const String& json) {
-/*  if (!mqttConnectWithRetries(3)) {
- // if (!ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt)) {
-    Serial.println(F("[PUB] MQTT not connected -> sleep and retry next wake"));
-    writeSDcardLog("[PUB] MQTT not connected -> sleep");
 
-//    modemPowerDownForSleep();
-//    goToSleepFlag = true;
-    return false;
-  }
-*/
   if (!mqttClient.connected()){
     mqttConnectOnce();
   }
@@ -1112,268 +912,6 @@ bool publishTelemetryJSON(const char* topic, const String& json) {
 
   return true;
 }
-
-
-
-void scheduleNextTimeSync(bool success) {
-  if (success) {
-    // after success, relax retries (e.g., 6h; change to 24h if you prefer)
-    timeSyncBackoffMs = 6UL * 60UL * 60UL * 1000UL;
-  } else {
-    // exponential backoff up to 6h
-    if (timeSyncBackoffMs < 6UL * 60UL * 60UL * 1000UL)
-      timeSyncBackoffMs *= 2;
-  }
-  // jitter ±20% to avoid “sync storms”
-  uint32_t j = timeSyncBackoffMs / 5;
-  nextTimeSyncMs = millis() + (timeSyncBackoffMs - j + (rand() % (2*j + 1)));
-  Serial.print("[TIME] Next sync in ~");
-  Serial.print(timeSyncBackoffMs / 60000);
-  Serial.println(" min");
-}
-
-// Return true on success, sets TimeLib + RTCZero
-bool syncTimeViaNTP_UDP(uint32_t overallMs = 15000) {
-  Serial.println("[NTP] Start");
-  NBUDP ntpUdp;  // fresh socket avoids stale state
-
-  // patient UDP open on ephemeral port
-  auto openUDP = [&](uint32_t totalMs)->bool {
-    unsigned long t0 = millis();
-    uint16_t attempt = 0;
-    while (millis() - t0 < totalMs) {
-      if (ntpUdp.begin(localPort)) return true;   // ephemeral local port
-      ntpUdp.stop();
-      delay(min<uint16_t>(150 + attempt*150, 800));
-      attempt++;
-    }
-    return false;
-  };
-
-  if (!openUDP(8000)) {
-    Serial.println("[NTP] UDP open failed");
-    ntpUdp.stop();
-    return false;
-  }
-
-  // NTP packet
-  const int NTP_PACKET_SIZE = 48;
-  static uint8_t pkt[NTP_PACKET_SIZE];
-  memset(pkt, 0, NTP_PACKET_SIZE);
-  pkt[0] = 0b11100011;   // LI, Version, Mode
-  pkt[2] = 6;            // Polling
-  pkt[3] = 0xEC;         // Precision
-  pkt[12]=49; pkt[13]=0x4E; pkt[14]=49; pkt[15]=52;
-
-  // DNS-free anycast/time hosts
-  const IPAddress servers[] = {
-    IPAddress(129, 6, 15, 28),   // time.nist.gov
-    IPAddress(216, 239, 35, 0),  // time.google.com
-    IPAddress(162, 159, 200, 1)  // time.cloudflare.com
-  };
-
-  auto tryOne = [&](const IPAddress& ip)->bool {
-    if (!ntpUdp.beginPacket(ip, 123)) return false;
-    ntpUdp.write(pkt, NTP_PACKET_SIZE);
-    if (!ntpUdp.endPacket()) return false;
-
-    unsigned long t0 = millis();
-    while (millis() - t0 < 2500) {
-      int sz = ntpUdp.parsePacket();
-      if (sz >= NTP_PACKET_SIZE) {
-        ntpUdp.read(pkt, NTP_PACKET_SIZE);
-        uint32_t secs1900 =
-          (uint32_t(pkt[40])<<24)|(uint32_t(pkt[41])<<16)|(uint32_t(pkt[42])<<8)|uint32_t(pkt[43]);
-        const uint32_t seventyYears = 2208988800UL;
-        if (secs1900 > seventyYears) {
-          time_t epoch = secs1900 - seventyYears;
-          setTime(epoch);
-          rtc.setTime(hour(), minute(), second());
-          rtc.setDate(day(), month(), (year()-2000));
-          Serial.print("[NTP] OK epoch "); Serial.println(epoch);
-          #if ENABLE_DEBUG
-            Serial.print("[NTP] UTC: ");
-            Serial.print(year());
-            Serial.print("-");
-            Serial.print(month());
-            Serial.print("-");
-            Serial.print(day());
-            Serial.print(" ");
-            Serial.print(hour());
-            Serial.print(":");
-            Serial.print(minute());
-            Serial.print(":");
-            Serial.println(second());
-          #endif
-
-          return true;
-        }
-      }
-      delay(50);
-    }
-    return false;
-  };
-
-  unsigned long start = millis();
-  bool ok = false;
-  for (const auto& ip : servers) {
-    if (millis() - start > overallMs) break;
-    if (tryOne(ip)) { ok = true; break; }
-  }
-  ntpUdp.stop();
-  if (!ok) Serial.println("[NTP] No reply");
-  return ok;
-}
-
-// Return true on success, sets TimeLib + RTCZero
-bool syncTimeViaHTTPDate_IP(uint32_t connectMs = 6000) {
-  Serial.println("[HTTP-Date] Start");
-  NBClient http;
-  IPAddress hostIP(93, 184, 216, 34); // example.com
-
-  if (!http.connect(hostIP, 80)) {
-    Serial.println("[HTTP-Date] TCP connect failed");
-    http.stop();
-    return false;
-  }
-
-  http.print(
-    "GET / HTTP/1.1\r\n"
-    "Host: example.com\r\n"
-    "Connection: close\r\n\r\n"
-  );
-
-  unsigned long t0 = millis();
-  while (!http.available() && millis() - t0 < connectMs) delay(50);
-
-  String line, dateLine;
-  while (http.connected()) {
-    int c = http.read();
-    if (c < 0) { delay(5); continue; }
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (line.length() == 0) break;          // end headers
-      if (line.startsWith("Date:")) dateLine = line;
-      line = "";
-    } else line += char(c);
-  }
-  http.stop();
-
-  if (dateLine.length() == 0) { Serial.println("[HTTP-Date] No Date header"); return false; }
-
-  // "Date: Wed, 12 Nov 2025 15:22:12 GMT"
-  int comma = dateLine.indexOf(',');
-  int sp1 = dateLine.indexOf(' ', comma+1);
-  if (comma < 0 || sp1 < 0) return false;
-  String rest = dateLine.substring(sp1+1); rest.trim();  // "12 Nov 2025 15:22:12 GMT"
-
-  int s1 = rest.indexOf(' ');
-  int s2 = rest.indexOf(' ', s1+1);
-  int s3 = rest.indexOf(' ', s2+1);
-  if (s1<0 || s2<0 || s3<0) return false;
-
-  int d = rest.substring(0, s1).toInt();
-  String mon = rest.substring(s1+1, s2);
-  int yy = rest.substring(s2+1, s3).toInt();
-  String hms = rest.substring(s3+1);
-  int spGMT = hms.indexOf(' '); if (spGMT > 0) hms = hms.substring(0, spGMT);
-  int c1 = hms.indexOf(':'), c2 = hms.indexOf(':', c1+1);
-  if (c1<0 || c2<0) return false;
-  int hh = hms.substring(0, c1).toInt();
-  int mm = hms.substring(c1+1, c2).toInt();
-  int ss = hms.substring(c2+1).toInt();
-
-  int monthNum =
-    (mon=="Jan")?1:(mon=="Feb")?2:(mon=="Mar")?3:(mon=="Apr")?4:(mon=="May")?5:
-    (mon=="Jun")?6:(mon=="Jul")?7:(mon=="Aug")?8:(mon=="Sep")?9:(mon=="Oct")?10:
-    (mon=="Nov")?11:(mon=="Dec")?12:0;
-  if (!monthNum) return false;
-
-  tmElements_t tme;
-  tme.Second = ss; tme.Minute = mm; tme.Hour = hh;
-  tme.Day = d; tme.Month = monthNum; tme.Year = yy - 1970;
-  time_t epoch = makeTime(tme);
-  if (epoch < 1609459200UL) return false; // sanity >= 2021
-
-  setTime(epoch);
-  rtc.setTime(hour(), minute(), second());
-  rtc.setDate(day(), month(), (year()-2000));
-  Serial.print("[HTTP-Date] OK epoch "); Serial.println(epoch);
-  #if ENABLE_DEBUG
-  Serial.print("[HTTP] UTC: ");
-  Serial.print(year());
-  Serial.print("-");
-  Serial.print(month());
-  Serial.print("-");
-  Serial.print(day());
-  Serial.print(" ");
-  Serial.print(hour());
-  Serial.print(":");
-  Serial.print(minute());
-  Serial.print(":");
-  Serial.println(second());
-#endif
-  return true;
-}
-
-// Try once now (UDP first, then HTTP). Update flags & schedule next.
-bool timeSyncOnce() {
-  bool ok = syncTimeViaNTP_UDP(15000);
-  if (!ok) ok = syncTimeViaHTTPDate_IP(6000);
-
-  useServerTimestamp = !ok;
-  scheduleNextTimeSync(ok);
-  Serial.println(ok ? "[TIME] Sync OK (device timestamps enabled)"
-                    : "[TIME] Sync FAILED (using TB server timestamps)");
-  return ok;
-}
-
-// call periodically (e.g., in loop): only runs when due
-void timeSyncTick() {
-  if ((int32_t)(millis() - nextTimeSyncMs) >= 0) {
-    timeSyncOnce();
-  }
-}
-
-void bootSequence(){
-  Serial.println("\n=== BOOT ===");
-  nbAttachAPN_Flag = nbAttachAPN();
-  if(nbAttachAPN_Flag){
-    Serial.println(saraAT("AT+CGATT?", 2000));
-    Serial.println(saraAT("AT+CGPADDR=1", 3000));
-  }
-  else{
-    Serial.println("[BOOT] Attach failed");
-    writeSDcardLog("[BOOT] Attach failed");
-    return;
-  }
-
-  setupMqttClient();                       // your working helper
-  mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
-  if (!mqttConnectFlag) {
-    // one short PDP refresh + single retry
-//    gprs.detachGPRS(); delay(600);
-    if (nbAttachAPN(20000, 20000)) {
-      mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
-    }
-    if(!mqttConnectFlag){
-      Serial.println("[MQQT] Connection failed");
-      writeSDcardLog("[MQQT] Connection failed");
-    }
-  }
-
-  mqttConnectFlag = ensureMqttConnected(settings.tbHostString.c_str(), settings.tbPortInt);
-  if (!mqttConnectFlag) {
-    Serial.println("[BOOT] MQTT failed -> sleeping and retry next wake");
-    writeSDcardLog("[BOOT] MQTT failed -> sleep");
-
-//    modemPowerDownForSleep();   // important: drop modem current
-//    goToSleepFlag = true;       // your loop will deepSleep
-    return;
-  }
-
-}
-
 
 void readBatteryVoltage() {
   float v_adc = 0.0;
@@ -2011,9 +1549,6 @@ void setup() {
 
     if (!mqttConnectWithRetries(2)) {
       Serial.println("[BOOT] MQTT failed");
-
-//      modemPowerDown();
-//      LowPower.deepSleep(SLEEP_SECONDS * 1000);
     }
   }
 
@@ -2026,143 +1561,21 @@ void setup() {
     createAndSendGPSJsonMsg();  // Send initial Date/Time, Latitude and Longditude data from GPS to TB
 
       stage(4);  //  send initial GPS message complete, now loop
-//  }
-//  else{
-//    gpsRetryFlag = true;
-//  }
 
-/*
-  String payload = "{\"hello\":\"world\",\"rssi\":\"" + scanner.getSignalStrength() + "\"}";
-  Serial.print("[PUB] "); Serial.println(payload);
-
-  if (mqttClient.beginMessage(settings.tbTokenString.c_str())) {
-    mqttClient.print(payload);
-    bool ok = mqttClient.endMessage();
-    Serial.print("[PUB] endMessage -> "); Serial.println(ok ? "OK" : "FAIL");
-    stage(ok ? 6 : 10);
-  } else {
-    Serial.println("[PUB] beginMessage failed");
-  }
-*/
   unsigned long t1 = millis();
   while (millis() - t1 < 800) { 
     wdtFeed();  // <<< optional
     mqttClient.poll(); delay(20); 
   }
 
-//  modemPowerDown();
-//  Serial.println("[SLEEP] deepSleep");
-  delay(50);
-//  LowPower.deepSleep(SLEEP_SECONDS * 1000);
 }
 
-///////////////////////////////////////////////////////////
-//  SETUP
-///////////////////////////////////////////////////////////
-/*void setup() {
-//  Watchdog.disable();   // make sure a previous run didn't leave it ticking
-  //Pins
-  pinMode(LED_Ext, OUTPUT);
-  digitalWrite(LED_Ext, HIGH);  //  Put LED On to signal booting up.
-  pinMode(GPSpowerPin, OUTPUT);
-  digitalWrite(GPSpowerPin, LOW);
-  // Rain input
-  pinMode(PIN_RAIN, INPUT_PULLUP);
-  LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
-  
-  analogReadResolution(12);
-  analogReference(AR_DEFAULT);  // 3.3 V ref (default), explicit for clarity
-
-  //Serial Comms
-  Serial.begin(115200);
-  unsigned long t0 = millis(); while (!Serial && millis()-t0 < 4000) {}
-
-  printResetCause();
-
-  // Enable watchdog during boot sequences
-//  int wdtMs = Watchdog.enable(WDT_TIMEOUT_MS);
-//  Serial.print(F("[WDT] Boot watchdog enabled, timeout ~"));
-//  Serial.print(wdtMs);
-//  Serial.println(F(" ms"));
-
-  if(getSettings())  //  Read SlingShot Configs
-  {
-    Serial.println("Get Settings - Success");
-    serialPrintSettings();  //  Print configs to screen
-    ledBlink(1);   // SD OK
-  }
-  else
-  {
-    Serial.println("Get Settings - Failed");
-    writeSDcardLog("[SD] Get Settings - Failed");
-  }
-
-  //Intialise limits from uploaded settings
-  riverLevelMin = riverLevelRange_float;
-  riverLevelMinSendValue = riverLevelRange_float;
-
-  // RTC Setup
-  rtc.begin(); // initialize RTC 24H format
-  rtc.setAlarmSeconds(0);
-  rtc.setAlarmSeconds(settings.rtcAlarmSecond);
-  rtc.enableAlarm(rtc.MATCH_SS);
-  rtc.attachInterrupt(rtcWakeISR);
-  ledBlink(2);   // RTC OK
-
-  // -------------------------------------------------
-  // Fix #2: Run NetKick BEFORE bootSequence/MQTT so the
-  // MKRNB library isn't fighting modem state changes.
-  // -------------------------------------------------
-  Serial.println("[NET] Powering modem (nbAccess.begin())...");
-  int beginSt = nbAccess.begin();
-  Serial.print("[NET] nbAccess.begin() -> ");
-  Serial.println(beginSt);
-  ledBlink(3);   // modem powered
-
-
-  bool netOK = ensureNetworkReadyAnyLocation();
-  if (!netOK) {
-    Serial.println("[BOOT] Network attach failed (NetKick)");
-  }
-  if (netOK) ledBlink(4);  // registered
-  else       ledBlink(8);  // network fail (one-time)
-
-
-  bootSequence();
-
-  delay(3000);
-  gpsUpdateFlag = getGPSinfo();
-
-  // Give the modem ~1s to flush
-  unsigned long t1 = millis();
-  while (millis() - t1 < 1000) { mqttClient.poll(); delay(20); }
-
-  if(nbAttachAPN_Flag && mqttConnectFlag && gpsUpdateFlag){
-      #if ENABLE_DEBUG
-        Serial.println("createAndSendGPSJsonMsg");
-      #endif
-    createAndSendGPSJsonMsg();  // Send initial Date/Time, Latitude and Longditude data from GPS to TB
-  }
-  else{
-    gpsRetryFlag = true;
-  }
-
-  // We’ll re-enable the watchdog inside loop() on each wake
-  Watchdog.disable();
-      #if ENABLE_DEBUG
-        Serial.println("exitSetup");
-      #endif
-}
-*/
 ///////////////////////////////////////////////////////////
 //  START OF LOOP
 ///////////////////////////////////////////////////////////
 void loop()
 {
-  // Enable watchdog while we are awake and doing work
-//  Watchdog.enable(WDT_TIMEOUT_MS);
-  mqttClient.poll(); // keepalive
-//  Watchdog.reset();  // we’re alive here
+  if (mqttClient.connected()) mqttClient.poll(); // keepalive if mqtt connected
 
   if(rtcWakeFlag){  //  RTC Alarm (1min)
     tsSendValue = rtc.getEpoch();  //  Time for JsonMsg if needed
@@ -2202,10 +1615,11 @@ void loop()
       }
       GPScounter = 0;
     }
-    ledBlink(1);
+    #if ENABLE_DEBUG
+      ledBlink(1);
+    #endif 
     resetAlarms();
     goToSleepFlag = true;
-  //  Watchdog.reset();   // finished handling the minute tick
   }
 
   if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
@@ -2222,20 +1636,26 @@ void loop()
   }
 
   if(sendMsgFlag){  //  Send Message
-    ledBlink(3);
     sendMsgFlag = false;  //clear flag
     #if ENABLE_DEBUG
       Serial.println("sendMessage!");
+      ledBlink(3);
     #endif 
 
-//    if (!nbAttachAPN_Flag){
-//      bootSequence(); //Try to connect again if boot failed
-//      //recoverNetworkAndMqtt();
-//    } 
+    // Bring network up only now
+    int bs = nbAccess.begin();
+    if (bs == 0) { /* handle */ }
+
+    if (!bringUpNetworkStable()) { /* log + bail */ }
+
+    if (!mqttConnectWithRetries(3)) { /* log + bail */ }
 
     //  This is where we do the sample averaging and message creation!
     calcSamples(currentSampleNo);
     createAndSendJsonMsg(); 
+
+    // Tear down immediately after send
+    modemPowerDownForSleep(false);
 
     //SD Card
     currentSDfilename = createSDfilename();
@@ -2248,51 +1668,17 @@ void loop()
     }
     writeSDcard(currentSDfilename, createSDcardPayload());  //  Write data
 
-    // after publish + drain
-//    if (!mqttClient.connected()) {
-//      timeSyncTick();
-//    }
-
-  //  Watchdog.reset();   // we successfully made it through send & SD
-
     //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
     if(sampleHour == 23 && sampleMinute == 59){
       rain24hrTipsCounter = 0;
     }
   }
 
-  // Sleep!
   if(goToSleepFlag){
-//    #if ENABLE_DEBUG
-//      Serial.println("Sleep!");
-//      delay(100);
-//    #endif
-//    goToSleepFlag = false;
-
-
-    // Put peripherals into low-power before sleeping
-//    Serial1.end();        // GPS UART
-
-    // SD card: release bus & CS
-//    SD.end();
-//    pinMode(SDchipSelect, INPUT_PULLUP);
-
-    // Make sure GPS is off (you already do it in getGPSinfo(), but belt & braces)
-    digitalWrite(GPSpowerPin, LOW);
-  //  Watchdog.reset();   // finished handling the minute tick  
-    // Disable WDT while we’re sleeping for ~60s
-  //  Watchdog.disable();
-
-    delay(100);
-  //  LowPower.idle();
-//    digitalWrite(LED_Ext, LOW);  //  Turn LED off.
-//    mqttClient.stop();
-//    nbClient.stop();
-    delay(100);
- //   modemPowerDownForSleep(true);
- //   LowPower.deepSleep();
-  //  LowPower.sleep();
+    prepareForSleep();
+    LowPower.sleep();   // or deepSleep
   }
+
 }
 
 ///////////////////////////////////////////////////////////

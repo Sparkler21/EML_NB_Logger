@@ -169,6 +169,8 @@ String previousSDfilename = "";
 String currentSDfilename = "";
 // minute samples
 float batteryVolts = 0;
+uint8_t rssi = 0;
+uint8_t pctSignalStrength = 0;
 uint8_t sampleNo = 0;
 uint16_t riverLevel = 0;
 float currentRiverLevel = 0;
@@ -350,7 +352,7 @@ static bool attachPdpWithApn(const char* apn, uint32_t ipTimeoutMs) {
   Serial.print("[NET] attachGPRS -> "); Serial.println((int)st);
 
   uint32_t t0 = millis();
-  while (millis() - t0 < ipTimeoutMs || ip_done == true) {
+  while (millis() - t0 < ipTimeoutMs) {
     wdtFeed();  // <<< WDT FEED HERE (can run up to 30s)
     IPAddress ip = gprs.getIPAddress();
     if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
@@ -718,6 +720,27 @@ void sampleTimeandDateFromRTC(){
   sampleDay = rtc.getDay();
 }
 
+static bool modemWakeAndInit(uint32_t readyTimeoutMs = 30000) {
+  // Start MKRNB state machine
+  Serial.println("[NET] nbAccess.begin()...");
+  int bs = nbAccess.begin();
+  Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
+
+  // Even if bs looks OK, after a shutdown() the modem may still be booting internally.
+  // So wait until AT works + SIM ready + CFUN=1.
+  if (!waitSimAndModemReady(readyTimeoutMs)) {
+    Serial.println("[NET] modemWakeAndInit: modem not ready");
+    return false;
+  }
+
+  // Ensure full RF on (in case you left it CFUN=0)
+  saraAT("AT+CFUN=1", 8000);
+  delay(1200);
+
+  return true;
+}
+
+
 String createSDfilename(){
 
   String SDfilename = "";
@@ -873,9 +896,10 @@ void writeSDcardLog(String dataString){
 
 bool publishTelemetryJSON(const char* topic, const String& json) {
 
-  if (!mqttClient.connected()){
-    mqttConnectOnce();
-  }
+if (!mqttClient.connected()) {
+  Serial.println("[PUB] MQTT not connected; skip publish");
+  return false;
+}
   if (!mqttClient.beginMessage(topic)) {
     Serial.println(F("[PUB] beginMessage failed -> sleep and retry next wake"));
     writeSDcardLog("[PUB] beginMessage failed -> sleep");
@@ -925,7 +949,19 @@ void readBatteryVoltage() {
   v_adc = ((adc/N) / 4095.0) * 3.3f; //
   batteryVolts = v_adc * 1.275f;  // Reverse the voltage divider (1.2 MOhm and 330 kOhm)
   #if ENABLE_DEBUG
-    Serial.print("Battery Volts = "); Serial.println(batteryVolts);
+    Serial.print("Battery Volts = "); Serial.print(batteryVolts); Serial.print(", ");
+  #endif
+}
+void readRSSI() {
+  rssi = scanner.getSignalStrength().toInt();
+  if (rssi == 99){
+    pctSignalStrength = 0;
+  }
+  else{
+    pctSignalStrength = rssi * 3;
+  }
+    #if ENABLE_DEBUG
+    Serial.print("SignalStr = "); Serial.print(pctSignalStrength); Serial.print(", ");
   #endif
 }
 
@@ -1020,29 +1056,32 @@ void createAndSendJsonMsg(){
     if (settings.sensorsMode == 0) {
       payload += "[{\"ts\":"; payload += tsSendValue; payload += "000";
       payload += ",\"values\":{";
-      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
-      payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
-      payload += "\"rlAve\":";   payload += riverLevelAveSendValue;    payload += ",";
+      payload += "\"device\":\""; payload += settings.deviceID;           payload += "\",";
+      payload += "\"batV\":";     payload += batteryVolts;                payload += ",";
+      payload += "\"signalStr\":";     payload += pctSignalStrength;      payload += ",";
+      payload += "\"rlAve\":";    payload += riverLevelAveSendValue;      payload += ",";
       #if ENABLE_MAX_MIN_RL
-      payload += "\"rlMax\":";   payload += riverLevelMaxSendValue;    payload += ",";
-      payload += "\"rlMin\":";   payload += riverLevelMinSendValue;    payload += ",";
+      payload += "\"rlMax\":";    payload += riverLevelMaxSendValue;      payload += ",";
+      payload += "\"rlMin\":";    payload += riverLevelMinSendValue;      payload += ",";
       #endif
-      payload += "\"rainInt\":"; payload += rainIntervalSendValue;     payload += ",";
-      payload += "\"rain24hr\":";payload += rain24hrSendValue;
+      payload += "\"rainInt\":";  payload += rainIntervalSendValue;       payload += ",";
+      payload += "\"rain24hr\":"; payload += rain24hrSendValue;
       payload += "}}]";
     } else if (settings.sensorsMode == 1) {
-      payload += "[{\"ts\":"; payload += tsSendValue; payload += "000";
+      payload += "[{\"ts\":";     payload += tsSendValue; payload += "000";
       payload += ",\"values\":{";
-      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
-      payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
-      payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
+      payload += "\"device\":\""; payload += settings.deviceID;           payload += "\",";
+      payload += "\"batV\":";     payload += batteryVolts;                payload += ",";
+      payload += "\"signalStr\":";     payload += pctSignalStrength;           payload += ",";
+      payload += "\"rainInt\":";  payload += rainIntervalSendValue;       payload += ",";
       payload += "\"rain24hr\":"; payload += rain24hrSendValue;
       payload += "}}]";
     } else { // 2
-      payload += "[{\"ts\":"; payload += tsSendValue; payload += "000";
+      payload += "[{\"ts\":";     payload += tsSendValue; payload += "000";
       payload += ",\"values\":{";
-      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
-      payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
+      payload += "\"device\":\""; payload += settings.deviceID;           payload += "\",";
+      payload += "\"batV\":";     payload += batteryVolts;                payload += ",";
+      payload += "\"signalStr\":";     payload += pctSignalStrength;           payload += ",";
       payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; 
       #if ENABLE_MAX_MIN_RL
       payload += ",";
@@ -1055,27 +1094,30 @@ void createAndSendJsonMsg(){
     // server timestamp: plain object (no ts, no "values" wrapper)
     if (settings.sensorsMode == 0) {
       payload += "{";
-      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
-      payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
-      payload += "\"rlAve\":";   payload += riverLevelAveSendValue;    payload += ",";
+      payload += "\"device\":\""; payload += settings.deviceID;           payload += "\",";
+      payload += "\"batV\":";    payload += batteryVolts;                 payload += ",";
+      payload += "\"signalStr\":";     payload += pctSignalStrength;           payload += ",";
+      payload += "\"rlAve\":";   payload += riverLevelAveSendValue;       payload += ",";
       #if ENABLE_MAX_MIN_RL
-      payload += "\"rlMax\":";   payload += riverLevelMaxSendValue;    payload += ",";
-      payload += "\"rlMin\":";   payload += riverLevelMinSendValue;    payload += ",";
+      payload += "\"rlMax\":";   payload += riverLevelMaxSendValue;       payload += ",";
+      payload += "\"rlMin\":";   payload += riverLevelMinSendValue;       payload += ",";
       #endif
-      payload += "\"rainInt\":"; payload += rainIntervalSendValue;     payload += ",";
+      payload += "\"rainInt\":"; payload += rainIntervalSendValue;        payload += ",";
       payload += "\"rain24hr\":";payload += rain24hrSendValue;
       payload += "}";
     } else if (settings.sensorsMode == 1) {
       payload += "{";
-      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
-      payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
-      payload += "\"rainInt\":";  payload += rainIntervalSendValue;    payload += ",";
+      payload += "\"device\":\""; payload += settings.deviceID;           payload += "\",";
+      payload += "\"batV\":";    payload += batteryVolts;                 payload += ",";
+      payload += "\"signalStr\":";     payload += pctSignalStrength;           payload += ",";
+      payload += "\"rainInt\":";  payload += rainIntervalSendValue;       payload += ",";
       payload += "\"rain24hr\":"; payload += rain24hrSendValue;
       payload += "}";
     } else {
       payload += "{";
-      payload += "\"device\":\""; payload += settings.deviceID; payload += "\",";
-      payload += "\"batV\":";    payload += batteryVolts;              payload += ",";
+      payload += "\"device\":\""; payload += settings.deviceID;           payload += "\",";
+      payload += "\"batV\":";    payload += batteryVolts;                 payload += ",";
+      payload += "\"signalStr\":";     payload += pctSignalStrength;           payload += ",";
       payload += "\"riverLevelAve\":"; payload += riverLevelAveSendValue; 
       #if ENABLE_MAX_MIN_RL
       payload += ",";
@@ -1124,6 +1166,7 @@ String createSDcardPayloadHeader(){
     payloadHeader += ("Time"); payloadHeader += (",");
     payloadHeader += ("Device"); payloadHeader += (",");
     payloadHeader += ("BatteryVolts"); payloadHeader += (",");
+    payloadHeader += ("SignalStr"); payloadHeader += (",");
     if (settings.sensorsMode == 0){  //  Both RL and Rain
       payloadHeader += ("RiverLevel-Ave"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
@@ -1150,6 +1193,7 @@ String createSDcardPayloadHeader(){
     payloadHeader += ("hh:mm:ss"); payloadHeader += (",");
     payloadHeader += ("Name"); payloadHeader += (",");
     payloadHeader += ("V"); payloadHeader += (",");
+    payloadHeader += ("%"); payloadHeader += (",");  // 0-31... 31 being the strongest.  99
     if (settings.sensorsMode == 0){  //  Both RL and Rain
       payloadHeader += ("cm"); payloadHeader += (",");
       #if ENABLE_MAX_MIN_RL
@@ -1182,6 +1226,7 @@ String createSDcardPayload(){
     payload += (sampleHour); payload += (":"); payload += (sampleMinute); payload += (":"); payload += (sampleSecond); payload += (",");
     payload += (settings.deviceID); payload += (",");
     payload += (batteryVolts); payload += (",");
+    payload += (pctSignalStrength); payload += (",");
     if (settings.sensorsMode == 0){  //  Both RL and Rain
       payload += (riverLevelAveSendValue); payload += (","); 
       #if ENABLE_MAX_MIN_RL
@@ -1522,7 +1567,7 @@ void setup() {
   int bs = nbAccess.begin();
   Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
 
-  if(bs == 0){  //Reboot and try again
+  if(bs <= 1){  //Reboot and try again
     Watchdog.enable(1000);
   }
 
@@ -1582,10 +1627,17 @@ void loop()
     sampleTimeandDateFromRTC();
     rtcWakeFlag = false;
     #if ENABLE_DEBUG
+//      if (Serial) {
+//        Serial.println("[DBG] Awake");
+//        Serial.flush();
+//        delay(200);                 // small window to actually see it
+//      }
       Serial.println("rtcWakeISR!");
     #endif
+
     //Read the LiPo battery volts level
     readBatteryVoltage();
+    readRSSI();  //  Read RSSI and convert to percentage signal strength
     // Sample Sensors
     if(settings.sensorsMode == 0 || settings.sensorsMode == 2){  //River Level
       takeRiverLevelSamples(currentSampleNo);
@@ -1630,32 +1682,50 @@ void loop()
         Serial.print("rainCount: "); Serial.print(rainTipsCounter);
         Serial.print(", rainCount24hr: "); Serial.println(rain24hrTipsCounter);
       #endif
-      resetAlarms();
-      goToSleepFlag = true;
+//      resetAlarms();
+//      goToSleepFlag = true;
     }
   }
 
   if(sendMsgFlag){  //  Send Message
     sendMsgFlag = false;  //clear flag
+
     #if ENABLE_DEBUG
       Serial.println("sendMessage!");
       ledBlink(3);
     #endif 
 
-    // Bring network up only now
-    int bs = nbAccess.begin();
-    if (bs == 0) { /* handle */ }
+  // Compute payload first (no modem needed)
+  calcSamples(currentSampleNo);
+/*
+  // Bring modem back from shutdown
+  if (!modemWakeAndInit(30000)) {
+    writeSDcardLog("[NET] wake/init failed");
+    // Optionally: schedule retry next minute by leaving sendMsgFlag true
+    // sendMsgFlag = true;
+    goto after_send;
+  }
 
-    if (!bringUpNetworkStable()) { /* log + bail */ }
+  // Bring up registration + PDP (your helper does APN loop etc.)
+  if (!bringUpNetworkStable()) {
+    writeSDcardLog("[NET] bringUpNetworkStable failed");
+    goto powerdown;
+  }
 
-    if (!mqttConnectWithRetries(3)) { /* log + bail */ }
+  // MQTT connect
+  if (!mqttConnectWithRetries(3)) {
+    writeSDcardLog("[MQTT] connect failed");
+    goto powerdown;
+  }
+*/
+  // Now publish
+  createAndSendJsonMsg();
 
-    //  This is where we do the sample averaging and message creation!
-    calcSamples(currentSampleNo);
-    createAndSendJsonMsg(); 
+powerdown:
+  // Tear down
+//  modemPowerDownForSleep(false);
 
-    // Tear down immediately after send
-    modemPowerDownForSleep(false);
+after_send:
 
     //SD Card
     currentSDfilename = createSDfilename();
@@ -1674,9 +1744,16 @@ void loop()
     }
   }
 
-  if(goToSleepFlag){
-    prepareForSleep();
-    LowPower.sleep();   // or deepSleep
+  if (goToSleepFlag) {
+    goToSleepFlag = false;        // <-- important
+//    prepareForSleep();
+
+    #if ENABLE_DEBUG
+      Serial.flush();             // push pending bytes out
+      delay(50);
+    #endif
+
+    LowPower.deepSleep();
   }
 
 }

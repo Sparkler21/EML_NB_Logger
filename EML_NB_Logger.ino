@@ -90,6 +90,7 @@ NBClient probeClient;
 MqttClient mqttClient(nbClient);
 NBUDP Udp;
 TinyGPS gps;
+NBModem modem;
 
 File    configFile;
 
@@ -167,6 +168,7 @@ volatile uint32_t rain24hrTipsCounter = 0;
 volatile uint32_t lastPulseUs = 0;
 String previousSDfilename = "";
 String currentSDfilename = "";
+volatile bool rainEnabled = false;
 // minute samples
 float batteryVolts = 0;
 uint8_t rssi = 0;
@@ -720,12 +722,51 @@ void sampleTimeandDateFromRTC(){
   sampleDay = rtc.getDay();
 }
 
+static bool modemPowerUp(bool printDiag = true) {
+  Serial.println("[PWR] Modem power-up...");
+
+  // Power the SARA back on (PWRKEY pulse)
+  modem.begin();
+
+  // Give the modem time to boot firmware
+  delay(1000);
+
+  // Wait until AT interface responds
+  unsigned long t0 = millis();
+  while (millis() - t0 < 15000) {
+    if (saraAT("AT", 1000).indexOf("OK") >= 0) {
+      break;
+    }
+    delay(300);
+  }
+
+  // Basic sanity config
+  saraAT("ATE0", 2000);      // echo off
+  saraAT("AT+CMEE=2", 2000);
+
+  // Re-enable RF stack (you shut it down earlier)
+  Serial.println("[PWR] RF on (CFUN=1)");
+  Serial.println(saraAT("AT+CFUN=1", 10000));
+
+  if (printDiag) {
+    Serial.println("[PWR] Diagnostics after wake");
+    Serial.println(saraAT("AT+CFUN?", 2000));
+    Serial.println(saraAT("AT+CPIN?", 2000));
+    Serial.println(saraAT("AT+CGATT?", 2000));
+  }
+
+  return saraAT("AT", 1000).indexOf("OK") >= 0;
+}
+
+
 static bool modemWakeAndInit(uint32_t readyTimeoutMs = 30000) {
   // Start MKRNB state machine
-  Serial.println("[NET] nbAccess.begin()...");
-  int bs = nbAccess.begin();
-  Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
-
+  int bs = 0;
+  while(bs <= 1){
+    Serial.println("[NET] nbAccess.begin()...");
+    nbAccess.begin();
+    Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
+  }
   // Even if bs looks OK, after a shutdown() the modem may still be booting internally.
   // So wait until AT works + SIM ready + CFUN=1.
   if (!waitSimAndModemReady(readyTimeoutMs)) {
@@ -1515,6 +1556,25 @@ void serialPrintSettings()
   Serial.println(F("-------------------------------------------------"));
 }
 
+static void scheduleNext10MinAlarm() {
+  uint8_t h = rtc.getHours();
+  uint8_t m = rtc.getMinutes();
+
+  uint8_t nextM = (uint8_t)((m / 10) * 10 + 10);
+  uint8_t nextH = h;
+
+  if (nextM >= 60) {
+    nextM = 0;
+    nextH = (uint8_t)((h + 1) % 24);
+  }
+
+  rtc.setAlarmHours(nextH);
+  rtc.setAlarmMinutes(nextM);
+  rtc.setAlarmSeconds(0);
+
+  rtc.enableAlarm(rtc.MATCH_HHMMSS);
+}
+
 
 ///////////////////////////////////////////////////////////
 //  SETUP
@@ -1522,11 +1582,17 @@ void serialPrintSettings()
 void setup() {
   //Pins
   pinMode(LED_Ext, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
   pinMode(GPSpowerPin, OUTPUT);
-  digitalWrite(GPSpowerPin, LOW);
   pinMode(PIN_RAIN, INPUT_PULLUP);  // Rain input
   LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
-  
+  digitalWrite(GPSpowerPin, LOW);  
+  digitalWrite(LED_BUILTIN, LOW);
+
+  //unused pins:
+  pinMode(2, INPUT_PULLUP);  // 
+  pinMode(6, INPUT_PULLUP);  // 
+
   analogReadResolution(12);
   analogReference(AR_DEFAULT);  // 3.3 V ref (default), explicit for clarity
 
@@ -1550,12 +1616,14 @@ void setup() {
     writeSDcardLog("[SD] Get Settings - Failed");
   }
 
+  rainEnabled = (settings.sensorsMode == 0 || settings.sensorsMode == 1);
+
+
   // RTC Setup
   rtc.begin(); // initialize RTC 24H format
-  rtc.setAlarmSeconds(0);
-  rtc.setAlarmSeconds(settings.rtcAlarmSecond);
-  rtc.enableAlarm(rtc.MATCH_SS);
-  rtc.attachInterrupt(rtcWakeISR);
+//  rtc.setAlarmSeconds(0);
+//  rtc.setAlarmSeconds(settings.rtcAlarmSecond);
+//  rtc.enableAlarm(rtc.MATCH_SS);
 
   //Intialise limits from uploaded settings
   riverLevelMin = riverLevelRange_float;
@@ -1573,7 +1641,10 @@ void setup() {
 
   stage(1);  //  nbAccess complete, now GPS
 
+  //  Time and alarm settings
   gpsUpdateFlag = getGPSinfo();  //  Flash LED during this
+  rtc.attachInterrupt(rtcWakeISR);
+  scheduleNext10MinAlarm();
 
   // after PDP is up, before MQTT
   delay(5000);                   // let routing/NAT settle
@@ -1612,7 +1683,7 @@ void setup() {
     wdtFeed();  // <<< optional
     mqttClient.poll(); delay(20); 
   }
-
+  goToSleepFlag = true;
 }
 
 ///////////////////////////////////////////////////////////
@@ -1620,143 +1691,108 @@ void setup() {
 ///////////////////////////////////////////////////////////
 void loop()
 {
-  if (mqttClient.connected()) mqttClient.poll(); // keepalive if mqtt connected
 
-  if(rtcWakeFlag){  //  RTC Alarm (1min)
-    tsSendValue = rtc.getEpoch();  //  Time for JsonMsg if needed
-    sampleTimeandDateFromRTC();
-    rtcWakeFlag = false;
-    #if ENABLE_DEBUG
-//      if (Serial) {
-//        Serial.println("[DBG] Awake");
-//        Serial.flush();
-//        delay(200);                 // small window to actually see it
-//      }
-      Serial.println("rtcWakeISR!");
-    #endif
-
-    //Read the LiPo battery volts level
-    readBatteryVoltage();
-    readRSSI();  //  Read RSSI and convert to percentage signal strength
-    // Sample Sensors
-    if(settings.sensorsMode == 0 || settings.sensorsMode == 2){  //River Level
-      takeRiverLevelSamples(currentSampleNo);
-    }
-    if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
-      takeRainSamples(currentSampleNo);
-    }
-    //See if 10minute period has arrived?
-    int modTest = (sampleMinute+1)%settings.samplingInterval;  //  Need to add 1 as now sampling just before the minute change on 59secs
-    if(modTest == 0){
-      sendMsgFlag = true;
-      #if ENABLE_DEBUG
-        Serial.println("Modulus!");
-      #endif
-    }
-    //Increment currentSampleNo and GPS update counter
-    currentSampleNo++;  // Increment sample counter
-    GPScounter++;
-
-    // Update GPS if counter time is up!
-    if((GPSupdateMins <= GPScounter) || gpsRetryFlag == true){
-      gpsUpdateFlag = getGPSinfo();
-      if(gpsUpdateFlag){
-        createAndSendGPSJsonMsg();  // Send Date/Time, Latitude and Longditude data from GPS to TB
-        gpsUpdateFlag = false;
-        gpsRetryFlag = false;
-      }
-      GPScounter = 0;
-    }
-    #if ENABLE_DEBUG
-      ledBlink(1);
-    #endif 
-    resetAlarms();
+  // If woke due to rain tip only: go straight back to sleep
+  if (rainWakeFlag && !rtcWakeFlag) {
+    rainWakeFlag = false;
     goToSleepFlag = true;
-  }
-
-  if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
-    if(rainWakeFlag){  // Rain Sensor Alarm
-      rainWakeFlag = false;
-      #if ENABLE_DEBUG
-        Serial.print("rainWakeISR!, ");
-        Serial.print("rainCount: "); Serial.print(rainTipsCounter);
-        Serial.print(", rainCount24hr: "); Serial.println(rain24hrTipsCounter);
-      #endif
-//      resetAlarms();
-//      goToSleepFlag = true;
-    }
-  }
-
-  if(sendMsgFlag){  //  Send Message
-    sendMsgFlag = false;  //clear flag
-
     #if ENABLE_DEBUG
-      Serial.println("sendMessage!");
-      ledBlink(3);
-    #endif 
-
-  // Compute payload first (no modem needed)
-  calcSamples(currentSampleNo);
-/*
-  // Bring modem back from shutdown
-  if (!modemWakeAndInit(30000)) {
-    writeSDcardLog("[NET] wake/init failed");
-    // Optionally: schedule retry next minute by leaving sendMsgFlag true
-    // sendMsgFlag = true;
-    goto after_send;
-  }
-
-  // Bring up registration + PDP (your helper does APN loop etc.)
-  if (!bringUpNetworkStable()) {
-    writeSDcardLog("[NET] bringUpNetworkStable failed");
-    goto powerdown;
-  }
-
-  // MQTT connect
-  if (!mqttConnectWithRetries(3)) {
-    writeSDcardLog("[MQTT] connect failed");
-    goto powerdown;
-  }
-*/
-  // Now publish
-  createAndSendJsonMsg();
-
-powerdown:
-  // Tear down
-//  modemPowerDownForSleep(false);
-
-after_send:
-
-    //SD Card
-    currentSDfilename = createSDfilename();
-    if (currentSDfilename != previousSDfilename){  //New file so new header needed
-      if(!SD.exists(currentSDfilename)){
-        Serial.println("[SD] New Header");
-        writeSDcard(currentSDfilename, createSDcardPayloadHeader());  //  Write new header on new file only
-      }
-      previousSDfilename = currentSDfilename;  //  Update previous filename so we can move on...
-    }
-    writeSDcard(currentSDfilename, createSDcardPayload());  //  Write data
-
-    //if this is midnight we need to clear the 24hr counter!!!  But after the midnight sample and sendMsg has been done!
-    if(sampleHour == 23 && sampleMinute == 59){
-      rain24hrTipsCounter = 0;
-    }
-  }
-
-  if (goToSleepFlag) {
-    goToSleepFlag = false;        // <-- important
-//    prepareForSleep();
-
-    #if ENABLE_DEBUG
-      Serial.flush();             // push pending bytes out
-      delay(50);
+      Serial.print("rainWakeISR!, ");
+      Serial.print("rainCount: "); Serial.print(rainTipsCounter);
+      Serial.print(", rainCount24hr: "); Serial.println(rain24hrTipsCounter);
     #endif
-
-    LowPower.deepSleep();
   }
 
-}
+
+    // If woke due to 10-min alarm: do the expensive cycle
+    if (rtcWakeFlag) {
+      rtcWakeFlag = false;
+    #if ENABLE_DEBUG
+      Serial.println("rtcWakeISR!, ");
+    #endif
+      // Timestamp + sample time
+      tsSendValue = rtc.getEpoch();
+      sampleTimeandDateFromRTC();
+
+      // Read battery + RSSI (RSSI requires modem typically; if scanner needs modem, do it later)
+      readBatteryVoltage();
+
+      // River level: do it here (only once per 10 min)
+      currentSampleNo = 1;                  // since you now sample once per interval
+      riverLevelTotal = 0;
+      #if ENABLE_MAX_MIN_RL
+        riverLevelMax = 0;
+        riverLevelMin = riverLevelRange_float;
+      #endif
+      if (settings.sensorsMode == 0 || settings.sensorsMode == 2) {
+        takeRiverLevelSamples(1);
+        riverLevelAveSendValue = currentRiverLevel;   // single sample => average = sample
+        #if ENABLE_MAX_MIN_RL
+          riverLevelMaxSendValue = riverLevelMax;
+          riverLevelMinSendValue = riverLevelMin;
+        #endif
+        riverLevelTotal = 0;
+      }
+
+      // Rain values: use counters accumulated during sleep
+      if (settings.sensorsMode == 0 || settings.sensorsMode == 1) {
+        // atomically copy & clear
+        noInterrupts();
+        uint32_t tipsInterval = rainTipsCounter;
+        rainTipsCounter = 0;
+        uint32_t tips24 = rain24hrTipsCounter;
+        interrupts();
+
+        rainIntervalSendValue = tipsInterval * rainGaugeCF_float;
+        rain24hrSendValue     = tips24        * rainGaugeCF_float;
+      }
+    #if ENABLE_DEBUG
+      Serial.println("[PWR] Modem Power Up");
+    #endif
+      // Bring modem up, connect, read RSSI if you want it, send
+      modemPowerUp(false);
+      modemWakeAndInit(30000);
+
+      // (Optional) now RSSI (if it needs modem alive)
+      readRSSI();
+
+      bringUpNetworkStable();          // if you want your “stable network bring-up”
+      mqttConnectWithRetries(3);
+      createAndSendJsonMsg();
+    #if ENABLE_DEBUG
+      Serial.println("[PWR] Modem Power Down");
+    #endif
+      modemPowerDownForSleep(false);
+
+      // SD logging
+      currentSDfilename = createSDfilename();
+      if (currentSDfilename != previousSDfilename) {
+        if (!SD.exists(currentSDfilename)) writeSDcard(currentSDfilename, createSDcardPayloadHeader());
+        previousSDfilename = currentSDfilename;
+      }
+      writeSDcard(currentSDfilename, createSDcardPayload());
+
+      // Midnight reset (still works)
+      if (sampleHour == 23 && sampleMinute == 59) {
+        noInterrupts();
+        rain24hrTipsCounter = 0;
+        interrupts();
+      }
+
+      // Schedule next 10-min alarm and sleep
+      scheduleNext10MinAlarm();
+      goToSleepFlag = true;
+    }
+
+    if (goToSleepFlag) {
+      goToSleepFlag = false;
+      #if ENABLE_DEBUG
+        Serial.println("[PWR] Sleep");
+      #endif
+//      prepareForSleep();
+//      LowPower.deepSleep();   // <-- don’t forget to actually sleep
+    }
+  }
 
 ///////////////////////////////////////////////////////////
 //  END OF LOOP
@@ -1769,15 +1805,14 @@ void rtcWakeISR()
 }
 
 // Rain Interrupt function
-// ISR for rain tips (debounced)
 void rainWakeISR() {
-  if(settings.sensorsMode == 0 || settings.sensorsMode == 1){  //Rain
-    uint32_t t = micros();
-    rainWakeFlag = true;
-    if (t - lastPulseUs > 10000) { // ~10 ms debounce
-      rainTipsCounter++;
-      rain24hrTipsCounter++;
-      lastPulseUs = t;
-    }
+  if (!rainEnabled) return;
+
+  uint32_t t = micros();
+  if (t - lastPulseUs > 50000) { // 50 ms debounce (adjust if needed)
+    rainTipsCounter++;
+    rain24hrTipsCounter++;
+    lastPulseUs = t;
   }
+  rainWakeFlag = true; // just to know why we woke (optional)
 }

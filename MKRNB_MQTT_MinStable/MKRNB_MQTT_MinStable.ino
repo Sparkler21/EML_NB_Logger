@@ -71,7 +71,7 @@ GND-Return for the DC power supply. GND (& V+) must be ripple and noise free for
 #include <SPI.h>
 #include <SD.h>
 #include <TinyGPS.h>
-#include "NetKick.h"
+//#include "NetKick.h"
 /************************************************************
  * Enables debug support. To disable this feature set to 0.
  ***********************************************************/
@@ -92,12 +92,6 @@ static const char* DEVICE_ID = "HPT02";
 
 static const char* APNS[] = { "gigsky-02", "flolive.net", "ukapn" };
 static const int APN_COUNT = sizeof(APNS) / sizeof(APNS[0]);
-
-static const uint32_t REG_TIMEOUT_MS  = 45000;
-static const uint32_t PDP_TIMEOUT_MS  = 30000;
-static const uint32_t TCP_TIMEOUT_MS  = 8000;
-
-static const uint32_t SLEEP_SECONDS = 60;
 
 // Configuration settings (from SD Card)
 struct parameters {
@@ -129,389 +123,49 @@ RTCZero rtc;
 NBUDP Udp;
 TinyGPS gps;
 
-static IPAddress tbIp;
-static bool tbIpValid = false;
-
-// -------------------- Watchdog helpers (SleepyDog) --------------------
-static void wdtArmForMqttConnect() {
-  int actual = Watchdog.enable(16000);
-  Serial.print("[WDT] enabled, timeout = ");
-  Serial.print(actual);
-  Serial.println(" ms");
-}
-
-static void wdtDisarm() {
-  Watchdog.disable();
-  Serial.println("[WDT] disabled");
-}
-
-static void wdtFeed() {
-  // Only call reset() if watchdog is enabled; harmless if disabled in most builds,
-  // but we'll avoid calling wdtFeed() when disabled anyway.
-  Watchdog.reset();
-}
-
-static void wdtArmLongOp(uint32_t ms) {
-  int actual = Watchdog.enable(ms);
-  Serial.print("[WDT] enabled, timeout = ");
-  Serial.print(actual);
-  Serial.println(" ms");
-}
-
-static void wdtDoneLongOp() {
-  Watchdog.reset();
-  Watchdog.disable();
-  Serial.println("[WDT] disabled");
-}
-
-// -------------------- LED helpers --------------------
-static void ledOff() { digitalWrite(LED_Ext, LOW); }
-static void ledOn()  { digitalWrite(LED_Ext, HIGH); }
-static void ledBlink(uint8_t n, uint16_t onMs = 80, uint16_t offMs = 140) {
-  for (uint8_t i = 0; i < n; i++) { ledOn(); delay(onMs); ledOff(); delay(offMs); }
-}
-static void stage(uint8_t code) { ledOff(); delay(150); ledBlink(code); delay(250); }
-
-// -------------------- Network helpers --------------------
-static bool waitSimAndModemReady(uint32_t timeoutMs) {
-  Serial.println("[NET] Wait modem+SIM ready...");
-  uint32_t t0 = millis();
-
-  while (millis() - t0 < timeoutMs) {
-    // Basic AT
-    String at = saraAT("AT", 1000);
-    if (at.indexOf("OK") < 0) { delay(300); continue; }
-
-    // SIM ready?
-    String cpin = saraAT("AT+CPIN?", 1000);
-    if (cpin.indexOf("READY") < 0) { delay(500); continue; }
-
-    // Full functionality?
-    String cfun = saraAT("AT+CFUN?", 1000);
-    if (cfun.indexOf("+CFUN: 1") < 0) { delay(500); continue; }
-
-    Serial.println("[NET] Modem+SIM ready");
-    return true;
-  }
-
-  Serial.println("[NET] Modem+SIM ready timeout");
-  return false;
-}
-
-static bool waitForIp(uint32_t timeoutMs) {
-  unsigned long t0 = millis();
-  while (millis() - t0 < timeoutMs) {
-    wdtFeed();  // <<< WDT FEED HERE (loop can run a long time)
-    IPAddress ip = gprs.getIPAddress();
-    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
-      Serial.print("[NET] IP: "); Serial.println(ip);
-      return true;
-    }
-    delay(500);
-  }
-  return false;
-}
-
-static bool ensureRegisteredWithKicks(uint32_t regTimeoutMs) {
-  Serial.println("[NET] Wait for registration (CEREG)...");
-  saraAT("AT+CEREG=2", 2000);
-  saraAT("AT+COPS=0", 10000);
-
-  uint32_t t0 = millis();
-  uint32_t lastKickMs = 0;
-
-  while (millis() - t0 < regTimeoutMs) {
-    wdtFeed();  // <<< WDT FEED HERE (this loop can run 45s)
-    String r = saraAT("AT+CEREG?", 2000);
-    int stat = parseCeregStat(r);
-    Serial.print("[NET] "); Serial.println(r);
-
-    if (stat == 1 || stat == 5) {
-      Serial.println("[NET] Registered");
-      return true;
-    }
-    if (stat == 3) {
-      Serial.println("[NET] Registration denied");
-      return false;
-    }
-
-    // If we’re “searching” too long, kick the modem
-    // Kick every ~20s if not progressing
-    if (millis() - lastKickMs > 20000UL) {
-      lastKickMs = millis();
-      Serial.println("[NET] Stalled; kick: CFUN=0/1 + COPS=0");
-      saraAT("AT+CFUN=0", 8000);
-      delay(400);
-      saraAT("AT+CFUN=1", 8000);
-      delay(1200);
-      saraAT("AT+COPS=0", 10000);
-      delay(400);
-    }
-
-    delay(1500);
-  }
-
-  Serial.println("[NET] Registration timeout/failed");
-  return false;
-}
-
-static bool attachPdpWithApn(const char* apn, uint32_t ipTimeoutMs) {
-  bool ip_done = false;
-  Serial.print("[NET] Trying APN: "); Serial.println(apn);
-
-  // Clean socket state first
-  mqttClient.stop();
-  nbClient.stop();
-  delay(150);
-
-  // PDP down (fresh context)
-  gprs.detachGPRS();
-  delay(600);
-
-  // Make APN take effect
-  saraAT("AT+CGACT=0,1", 8000);
-  delay(150);
-
-  String cmd = String("AT+CGDCONT=1,\"IP\",\"") + apn + "\"";
-  Serial.print("[NET] "); Serial.println(cmd);
-  Serial.println(saraAT(cmd.c_str(), 3000));
-  Serial.println(saraAT("AT+CGDCONT?", 3000));
-
-  Serial.println("[NET] attachGPRS(true)...");
-  NB_NetworkStatus_t st = gprs.attachGPRS(true);
-  Serial.print("[NET] attachGPRS -> "); Serial.println((int)st);
-
-  uint32_t t0 = millis();
-  while (millis() - t0 < ipTimeoutMs || ip_done == true) {
-    wdtFeed();  // <<< WDT FEED HERE (can run up to 30s)
-    IPAddress ip = gprs.getIPAddress();
-    if ((ip[0] | ip[1] | ip[2] | ip[3]) != 0) {
-      Serial.print("[NET] IP: "); Serial.println(ip);
-      Serial.println(saraAT("AT+CGATT?", 2000));
-      Serial.println(saraAT("AT+CGPADDR=1", 3000));
-      ip_done = true;
-      return true;
-    }
-    delay(500);
-  }
-
-  Serial.println("[NET] PDP/IP timeout");
-  return false;
-}
-
-static bool bringUpNetworkStable() {
-  // If SARA serial is wedged, recover it first
-  if (!saraPing()) {
-    Serial.println("[NET] SerialSARA not responding; CFUN toggle");
-    saraAT("AT+CFUN=0", 8000);
-    delay(500);
-    saraAT("AT+CFUN=1", 8000);
-    delay(1500);
-  }
-
-  wdtFeed();  // <<< WDT FEED HERE (before big operations)
-
-  if (!ensureRegisteredWithKicks(REG_TIMEOUT_MS)) return false;
-
-  // Try APNs without re-running nbAccess.begin()
-  for (int i = 0; i < APN_COUNT; i++) {
-    if (attachPdpWithApn(APNS[i], PDP_TIMEOUT_MS)) {
-      Serial.println("[NET] Network OK");
-      
-      // Give NB/LTE-M a moment after IP assignment
-      delay(5000);
-
-      // DNS + TCP warmup: helps a lot with intermittent CONNACK=3 cases
-      if (!dnsResolveTB()) {
-        Serial.println("[DNS] Resolve failed (will still try MQTT)");
-      }
-
-//      if (!tcpProbeTB(12000)) {
-//        Serial.println("[TCP] Broker unreachable right now");
-//        // Optional: treat as network failure so APN loop can retry
-//        return false;
-//      }
-      return true;
-    }
-  }
-  Serial.println("[NET] All APNs failed");
-  return false;
-}
-
-static bool dnsResolveTB() {
-  String cmd = String("AT+UDNSRN=0,\"") + TB_HOST + "\"";
-  String r = saraAT(cmd.c_str(), 12000);
-
-  Serial.print("[DNS] "); Serial.println(cmd);
-  Serial.println(r);
-
-  // Success if it contains "+UDNSRN:" AND "OK"
-  bool ok = (r.indexOf("+UDNSRN:") >= 0) && (r.indexOf("\nOK") >= 0 || r.endsWith("OK\r\n") || r.indexOf("OK") >= 0);
-
-  Serial.print("[DNS] ok="); Serial.println(ok ? "true" : "false");
-  return ok;
-}
-
-
-
-static bool tcpProbeTB(uint32_t timeoutMs) {
-  Serial.println("[TCP] Probe broker...");
-  probeClient.setTimeout(timeoutMs);
-
-  bool ok;
-  if (tbIpValid) ok = probeClient.connect(tbIp, TB_PORT);
-  else          ok = probeClient.connect(TB_HOST, TB_PORT);
-
-  if (!ok) {
-    Serial.println("[TCP] Probe failed");
-    probeClient.stop();
-    return false;
-  }
-
-  Serial.println("[TCP] Probe OK");
-  probeClient.stop();
-  delay(200);
-  return true;
-}
-
-
-// -------------------- MQTT helpers --------------------
-static void mqttConfigure() {
-  nbClient.setTimeout(TCP_TIMEOUT_MS);
-
-  String cid = String(DEVICE_ID) + "-" + String((uint32_t)millis(), HEX);
-  mqttClient.setId(cid);
-
-  mqttClient.setUsernamePassword(TB_TOKEN, "");
-  mqttClient.setKeepAliveInterval(45 * 1000);
-}
-
-static bool mqttConnectOnce() {
-  mqttConfigure();
-  Serial.print("[MQTT] Connecting to "); Serial.print(TB_HOST); Serial.print(":"); Serial.println(TB_PORT);
-
-  mqttClient.stop();
-  nbClient.stop();
-  delay(1000);
-  // light socket close attempt (ignore failures)
-  saraAT("AT+USOCL=0", 2000);
-  saraAT("AT+USOCL=1", 2000);
-  delay(200);
-
-  // If this *still* blocks, we’ll handle it next by guarding with WDT.
-  bool ok = mqttClient.connect(TB_HOST, TB_PORT);
-
-  if (!ok) {
-    int e = mqttClient.connectError();
-    Serial.print("[MQTT] connectError="); Serial.println(e);
-    return false;
-  }
-  Serial.println("[MQTT] Connected");
-  stage(5);
-  return true;
-}
-
-static bool mqttConnectWithRetries(int attempts) {
-  mqttConfigure();
-  nbClient.setTimeout(15000);
-  mqttClient.setConnectionTimeout(15000);
-
-  bool didPdpRebuild = false;
-
-  for (int i = 1; i <= attempts; i++) {
-    Serial.print("[MQTT] Connect attempt "); Serial.println(i);
-
-    // Clean socket state + give the network/NAT a moment
-    mqttClient.stop();
-    nbClient.stop();
-    delay(2000);
-
-    Serial.println("[WDT] Arm watchdog for MQTT connect");
-    wdtArmForMqttConnect();                 // 16s
-
-    Serial.println("[MQTT] Calling mqttClient.connect()");
-    bool ok = mqttClient.connect(TB_HOST, TB_PORT);
-
-    Serial.println("[WDT] MQTT connect returned; feeding watchdog");
-    wdtFeed();
-    Watchdog.disable();
-    Serial.println("[WDT] disabled");
-
-    if (ok) {
-      Serial.println("[MQTT] Connected");
-      stage(5);
-      return true;
-    }
-
-    int e = mqttClient.connectError();
-    Serial.print("[MQTT] connectError="); Serial.println(e);
-
-    // Cleanup after failure
-    mqttClient.stop();
-    nbClient.stop();
+void connectNB(){
+  int bs = 0;
+  Serial.println("[NET] nbAccess.begin()...");
+  while((bs = nbAccess.begin() != NB_READY) || 
+      (gprs.attachGPRS() != GPRS_READY)){
     delay(1000);
-
-    // Only do the PDP rebuild ONCE, and only for CONNACK=3
-    if (e == 3 && !didPdpRebuild) {
-      didPdpRebuild = true;
-      Serial.println("[MQTT] e=3: rebuild PDP then retry once");
-
-      Serial.println("[PDP] detachGPRS...");
-      wdtArmLongOp(30000);                 // 30s for PDP operations
-      gprs.detachGPRS();
-      wdtDoneLongOp();
-      Serial.println("[PDP] detachGPRS done");
-
-      delay(2500);
-
-      Serial.println("[PDP] attachGPRS(true)...");
-      wdtArmLongOp(30000);
-      NB_NetworkStatus_t st2 = gprs.attachGPRS(true);
-      wdtDoneLongOp();
-      Serial.print("[PDP] attachGPRS -> "); Serial.println((int)st2);
-
-      Serial.println("[PDP] waitForIp...");
-      bool gotIp = waitForIp(15000);
-      Serial.print("[PDP] waitForIp -> "); Serial.println(gotIp ? "OK" : "TIMEOUT");
-
-      // Give routing/NAT time to settle after reattach
-      delay(5000);
-
-      // Retry (loop continues to next attempt)
-      continue;
-    }
-
-    // If we reach here:
-    // - error wasn't 3, OR
-    // - error was 3 but we've already rebuilt PDP once
-    Serial.println("[MQTT] Not retrying further this cycle");
-    return false;
   }
-
-  return false;
+  Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
 }
 
-static void modemPowerDown() {
-  Serial.println("[PWR] stop MQTT/TCP");
-  mqttClient.stop();
-  nbClient.stop();
-  delay(500);
+void connectMQTT(){
+  while(mqttClient.connect(TB_HOST, TB_PORT)){
+    mqttClient.connectError();
+    delay(5000);
+  }
+}
 
-  Serial.println("[PWR] detach GPRS");
-  gprs.detachGPRS();
-  delay(500);
-
-  Serial.println("[PWR] nbAccess.shutdown()");
-  nbAccess.shutdown();
-  delay(500);
-
-  stage(7);
+void publishMessage(){
+  mqttClient.beginMessage("Mark/Dutton");
+  mqttClient.print("Hello world");
+  mqttClient.endMessage();
+  delay(1000);
 }
 
 // -------------------- Setup --------------------
 void setup() {
+  //Pins
   pinMode(LED_Ext, OUTPUT);
-  ledOn();
+  pinMode(LED_BUILTIN, OUTPUT);
+//  pinMode(GPSpowerPin, OUTPUT);
+//  pinMode(PIN_RAIN, INPUT_PULLUP);  // Rain input
+//  LowPower.attachInterruptWakeup(digitalPinToInterrupt(PIN_RAIN), rainWakeISR, FALLING);
+//  digitalWrite(GPSpowerPin, LOW);  
+  digitalWrite(LED_BUILTIN, LOW);
+
+  //unused pins:
+  pinMode(2, INPUT_PULLUP);  // 
+  pinMode(6, INPUT_PULLUP);  // 
+
+  analogReadResolution(12);
+  analogReference(AR_DEFAULT);  // 3.3 V ref (default), explicit for clarity
+
+//  ledOn();//  Put LED On to signal booting up.
 
   Serial.begin(115200);
   unsigned long t0 = millis();
@@ -519,74 +173,47 @@ void setup() {
 
   Serial.println("\n=== MIN STABLE BOOT ===");
 
-  stage(1);
-
   rtc.begin();
+/*
+  delay(3000);
 
-//  waitSimAndModemReady(15000);   // 15s on cold boot is reasonable
-  Serial.println("[NET] nbAccess.begin()...");            //char : 0 if asynchronous. If synchronous, returns status : 0=ERROR, 1=IDLE, 2=CONNECTING, 3=NB_READY, 4=GPRS_READY, 5=TRANSPARENT_CONNECTED
-  int bs = nbAccess.begin();
-  Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
+  int bs = 0;
+  t0 = millis();
 
+  do {
+    Serial.println("[NET] nbAccess.begin()...");
+    bs = nbAccess.begin();
+    Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
+    if (bs >= 2) break;
+    delay(1500);
+  } while (millis() - t0 < 30000);
 
-  if(bs == 0){  //Reboot and try again
-    Watchdog.enable(1000);
+  if (bs < 2) {
+    Serial.println("[BOOT] nbAccess.begin failed after 30s; reboot");
+    NVIC_SystemReset();   // cleaner than watchdog here
   }
+*/
+  mqttClient.setUsernamePassword(TB_TOKEN, "");
+  mqttClient.setId(DEVICE_ID);
 
 
-  // IMPORTANT: do NOT call nbAccess.begin() again per-APN
-//  if (!bringUpNetworkStable()) {
-//    Serial.println("[BOOT] Network failed");
-//    // sleep path...
-//  }
-
-  // after PDP is up, before MQTT
-  delay(5000);                   // let routing/NAT settle
-  saraAT("AT+CGATT?", 2000);      // quick sanity
-  saraAT("AT+CGPADDR=1", 3000);   // quick sanity
-
-  nbClient.setTimeout(8000);
-
-  if (!mqttConnectWithRetries(3)) {
-    // Last-resort: one modem kick then try again
-    Serial.println("[MQTT] retry failed; CFUN kick then final try");
-    saraAT("AT+CFUN=0", 8000);
-    delay(500);
-    saraAT("AT+CFUN=1", 8000);
-    delay(2000);
-
-    if (!mqttConnectWithRetries(2)) {
-      Serial.println("[BOOT] MQTT failed");
-      stage(9);
-      modemPowerDown();
-      ledOff();
-      LowPower.deepSleep(SLEEP_SECONDS * 1000);
-    }
-  }
-
-  String payload = "{\"hello\":\"world\",\"rssi\":\"" + scanner.getSignalStrength() + "\"}";
-  Serial.print("[PUB] "); Serial.println(payload);
-
-  if (mqttClient.beginMessage(TB_TOPIC)) {
-    mqttClient.print(payload);
-    bool ok = mqttClient.endMessage();
-    Serial.print("[PUB] endMessage -> "); Serial.println(ok ? "OK" : "FAIL");
-    stage(ok ? 6 : 10);
-  } else {
-    Serial.println("[PUB] beginMessage failed");
-  }
-
-  unsigned long t1 = millis();
-  while (millis() - t1 < 800) { 
-    wdtFeed();  // <<< optional
-    mqttClient.poll(); delay(20); 
-  }
-
-  modemPowerDown();
-  ledOff();
-  Serial.println("[SLEEP] deepSleep");
-  delay(50);
-  LowPower.deepSleep(SLEEP_SECONDS * 1000);
 }
 
-void loop() {}
+void loop() {
+
+  if(nbAccess.status() != NB_READY || gprs.status() != GPRS_READY){
+    connectNB();
+  }
+
+  if (mqttClient.connected()){
+    connectMQTT();
+  }
+
+  mqttClient.poll();
+  publishMessage();
+  delay(100);
+  nbAccess.shutdown();
+  delay(100);
+
+}
+

@@ -140,7 +140,7 @@ const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of th
 byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
 unsigned int localPort = 2390;      // local port to listen for UDP packets
 // --- Watchdog + network recovery state ---
-const int WDT_TIMEOUT_MS = 16000;          // ~16 s (max on SAMD21)
+const int WDT_TIMEOUT_MS = 12000;          // ~16 s (max on SAMD21)
 uint8_t netRecoverFailures = 0;
 const uint8_t NET_RECOVER_REBOOT_LIMIT = 3;
 // Flags
@@ -206,7 +206,7 @@ bool GPStimeReceived = false;
 ///////////////////////////////////////////////////////////
 // -------------------- Watchdog helpers (SleepyDog) --------------------
 static void wdtArmForMqttConnect() {
-  int actual = Watchdog.enable(16000);
+  int actual = Watchdog.enable(12000);
   Serial.print("[WDT] enabled, timeout = ");
   Serial.print(actual);
   Serial.println(" ms");
@@ -484,8 +484,8 @@ static bool mqttConnectOnce() {
 
 static bool mqttConnectWithRetries(int attempts) {
   mqttConfigure();
-  nbClient.setTimeout(15000);
-  mqttClient.setConnectionTimeout(15000);
+  nbClient.setTimeout(12000);
+  mqttClient.setConnectionTimeout(12000);
 
   bool didPdpRebuild = false;
 
@@ -497,16 +497,28 @@ static bool mqttConnectWithRetries(int attempts) {
     nbClient.stop();
     delay(2000);
 
-    Serial.println("[WDT] Arm watchdog for MQTT connect");
-    wdtArmForMqttConnect();                 // 16s
+   // Serial.println("[WDT] Arm watchdog for MQTT connect");
+   // wdtArmForMqttConnect();                 // 16s
+
+    // inside each attempt, before mqttClient.connect()
+    mqttClient.stop();
+    nbClient.stop();
+    delay(300);
+
+    // close possible lingering sockets in SARA (ignore failures)
+    saraAT("AT+USOCL=0", 2000);
+    saraAT("AT+USOCL=1", 2000);
+    saraAT("AT+USOCL=2", 2000);
+    saraAT("AT+USOCL=3", 2000);
+    delay(300);
 
     Serial.println("[MQTT] Calling mqttClient.connect()");
     bool ok = mqttClient.connect(settings.tbHostString.c_str(), settings.tbPortInt);
 
-    Serial.println("[WDT] MQTT connect returned; feeding watchdog");
-    wdtFeed();
-    Watchdog.disable();
-    Serial.println("[WDT] disabled");
+  //  Serial.println("[WDT] MQTT connect returned; feeding watchdog");
+  //  wdtFeed();
+  //  Watchdog.disable();
+  //  Serial.println("[WDT] disabled");
 
     if (ok) {
       Serial.println("[MQTT] Connected");
@@ -544,8 +556,7 @@ static bool mqttConnectWithRetries(int attempts) {
       bool gotIp = waitForIp(15000);
       Serial.print("[PDP] waitForIp -> "); Serial.println(gotIp ? "OK" : "TIMEOUT");
 
-      // Give routing/NAT time to settle after reattach
-      delay(5000);
+      delay(8000);   // give routing/NAT time to settle after reattach
 
       // Retry (loop continues to next attempt)
       continue;
@@ -760,26 +771,39 @@ static bool modemPowerUp(bool printDiag = true) {
 
 
 static bool modemWakeAndInit(uint32_t readyTimeoutMs = 30000) {
-  // Start MKRNB state machine
+  Serial.println("[NET] nbAccess.begin()...");
+
+  uint32_t t0 = millis();
   int bs = 0;
-  while(bs <= 1){
-    Serial.println("[NET] nbAccess.begin()...");
-    nbAccess.begin();
+
+  while (millis() - t0 < readyTimeoutMs) {
+    bs = nbAccess.begin();   // <-- CRITICAL FIX
     Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
+
+    // 0=ERROR, 1=IDLE, 2=CONNECTING, 3=NB_READY...
+    if (bs >= 2) break;
+
+    delay(1500);             // <-- don't hammer it
   }
-  // Even if bs looks OK, after a shutdown() the modem may still be booting internally.
-  // So wait until AT works + SIM ready + CFUN=1.
+
+  if (bs < 2) {
+    Serial.println("[NET] nbAccess.begin failed/timed out");
+    return false;
+  }
+
+  // After shutdown() the modem may still be booting internally:
   if (!waitSimAndModemReady(readyTimeoutMs)) {
     Serial.println("[NET] modemWakeAndInit: modem not ready");
     return false;
   }
 
-  // Ensure full RF on (in case you left it CFUN=0)
-  saraAT("AT+CFUN=1", 8000);
+  // Ensure RF on
+  Serial.println(saraAT("AT+CFUN=1", 8000));
   delay(1200);
 
   return true;
 }
+
 
 
 String createSDfilename(){
@@ -1602,6 +1626,8 @@ void setup() {
   unsigned long t0 = millis();
   while (!Serial && millis() - t0 < 3000) {}
 
+  printResetCause();
+
   Serial.println("\n=== MIN STABLE BOOT ===");
 
 
@@ -1631,13 +1657,22 @@ void setup() {
   ledOff();//  Put LED Off to signal start of connection
   delay(3000);
 
-  Serial.println("[NET] nbAccess.begin()...");            //char : 0 if asynchronous. If synchronous, returns status : 0=ERROR, 1=IDLE, 2=CONNECTING, 3=NB_READY, 4=GPRS_READY, 5=TRANSPARENT_CONNECTED
-  int bs = nbAccess.begin();
-  Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
+int bs = 0;
+t0 = millis();
 
-  if(bs <= 1){  //Reboot and try again
-    Watchdog.enable(1000);
-  }
+do {
+  Serial.println("[NET] nbAccess.begin()...");
+  bs = nbAccess.begin();
+  Serial.print("[NET] nbAccess.begin() -> "); Serial.println(bs);
+  if (bs >= 2) break;
+  delay(1500);
+} while (millis() - t0 < 30000);
+
+if (bs < 2) {
+  Serial.println("[BOOT] nbAccess.begin failed after 30s; reboot");
+  NVIC_SystemReset();   // cleaner than watchdog here
+}
+
 
   stage(1);  //  nbAccess complete, now GPS
 
@@ -1653,7 +1688,7 @@ void setup() {
 
   stage(2);  //  GPS Complete, Now MQTT
 
-  nbClient.setTimeout(8000);
+  nbClient.setTimeout(12000);
 
   if (!mqttConnectWithRetries(3)) {
     // Last-resort: one modem kick then try again

@@ -10,7 +10,7 @@ static const int  MQTT_PORT   = 1883;        // 8883 for TLS (more power + memor
 static const char MQTT_TOPIC[] = "v1/devices/me/telemetry";
 
 // How often to publish:
-static const uint32_t PUBLISH_PERIOD_SEC = 120; // 2 minutes
+static const uint32_t PUBLISH_PERIOD_SEC = 10; // 2 minutes
 
 // Connection time limits (keep short to save power):
 static const uint32_t NET_TIMEOUT_MS  = 90UL * 1000UL;
@@ -49,13 +49,18 @@ static void armNextAlarmFromNow(uint32_t secondsFromNow) {
 }
 
 static bool connectNetwork() {
+  int bs = 0;
+  int gp = 0;
+  Serial.println("[NET] ConnectNetwork"); 
   // Bring up modem + register + data context
   // NOTE: begin() can take time; keep retries low for power.
-  if (nbAccess.begin(PINNUMBER) != NB_READY) return false;
-
+  if (bs = nbAccess.begin(PINNUMBER, APN));
+  Serial.print("[NET] nbAccess -> ");
+  Serial.println(bs); 
   // Attach PDP context (GPRS class used by MKRNB for data)
-  if (gprs.attachGPRS(APN) != GPRS_READY) return false;
-
+  if (gp = gprs.attachGPRS(APN) != GPRS_READY) return false;
+  Serial.print("[NET] gprs -> ");
+  Serial.println(gp); 
   return true;
 }
 
@@ -63,6 +68,9 @@ static bool connectMqtt() {
   String mqttToken = "vxl9ZxrJ5J6soedld65D";
   String mqttDeviceID = "HPT02";
   String mqttID = mqttDeviceID + "-" + String((uint32_t)millis(), HEX);
+
+  Serial.println("[MQTT] Connecting..."); 
+
   mqtt.setId(mqttID);
   mqtt.setUsernamePassword(mqttToken.c_str(), "");
   // Optional keepalive small, but we disconnect after publish anyway:
@@ -77,6 +85,7 @@ static bool connectMqtt() {
 }
 
 static void disconnectAll() {
+  Serial.println("[NET] Disconnecting..."); 
   if (mqtt.connected()) mqtt.stop();
   // Power modem off to minimize current between wakeups:
   nbAccess.shutdown();  // documented API :contentReference[oaicite:3]{index=3}
@@ -84,11 +93,12 @@ static void disconnectAll() {
 
 static void publishOnce() {
   // 1) Network
+  Serial.println("[NET] publishOnce"); 
   uint32_t start = millis();
   while (!connectNetwork()) {
     if (millis() - start >= NET_TIMEOUT_MS) return;
     // If something half-started, shut down and retry cleanly
-    disconnectAll();
+//    disconnectAll();
     delay(1000);
   }
 
@@ -113,7 +123,11 @@ static void publishOnce() {
 
 void setup() {
   // If you’re on battery, avoid leaving Serial active (USB costs power).
-  // Serial.begin(115200);
+  Serial.begin(115200);
+  unsigned long t0 = millis();
+  while (!Serial && millis() - t0 < 3000) {}
+
+  Serial.println("\n=== MIN STABLE BOOT ===");
 
   rtc.begin(); // 24h init (RTCZero uses 24h internally)
 
@@ -134,7 +148,7 @@ void loop() {
   if (rtcFired) {
     // Acknowledge the wake
     rtcFired = false;
-    
+    Serial.println("[RTC] Fired!");  
     // Do the work
     publishOnce();
 
@@ -144,6 +158,6 @@ void loop() {
 
   // Deep sleep until RTC alarm interrupt wakes us
   // This is the lowest-power standby mode on SAMD21 via RTCZero.
-  rtc.standbyMode();
+//  rtc.standbyMode();
 }
 
